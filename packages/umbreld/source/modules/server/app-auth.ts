@@ -11,10 +11,12 @@ import {SessionIssuanceInvalidatedError} from '../auth/auth.js'
 import {serializeAccountAvatar, serveAccountAvatar} from '../user/avatar-api.js'
 import {OWNER_USER_ID} from '../user/constants.js'
 import {resolveWallpaperAppearance} from '../user/wallpapers.js'
+import safeRedirectPath from '../utilities/safe-redirect-path.js'
+import {isRemoteAuthRequest} from '../lan-ingress/remote-domain.js'
 
 type AppAuthRequest = {
 	appId: string
-	origin: 'host' | 'tor'
+	origin: 'host' | 'tor' | 'remote'
 	redirectPath: string
 }
 
@@ -24,21 +26,30 @@ function requestString(request: express.Request, name: string) {
 	return value
 }
 
-function parseAppAuthRequest(request: express.Request): AppAuthRequest {
+export function parseAppAuthRequest(umbreld: Umbreld, request: express.Request): AppAuthRequest {
 	const appId = requestString(request, 'app')
 	if (!/^[a-zA-Z0-9-]+$/.test(appId)) throw new Error('Invalid app')
 
 	const origin = requestString(request, 'origin')
-	if (origin !== 'host' && origin !== 'tor') throw new Error('Unsupported origin')
+	if (origin !== 'host' && origin !== 'tor' && origin !== 'remote') throw new Error('Unsupported origin')
+	// The remote flow is only valid on the configured auth host.
+	if (origin === 'remote' && !isRemoteAuthRequest(umbreld.lanIngress.remoteDomain, request.hostname)) {
+		throw new Error('Unsupported origin')
+	}
 
-	const requestedPath = requestString(request, 'path')
-	let redirectPath = '/'
-	try {
-		const url = new URL(requestedPath, 'http://umbrel.local')
-		redirectPath = `${url.pathname}${url.search}${url.hash}`
-	} catch {}
+	const redirectPath = safeRedirectPath(requestString(request, 'path'))
 
 	return {appId, origin, redirectPath}
+}
+
+// The exact https origin of an app on the remote domain, for a request that
+// arrived on the auth host. Built from config only.
+function remoteAppOriginForRequest(umbreld: Umbreld, request: express.Request) {
+	if (request.query.origin !== 'remote') return
+	const appId = request.query.app
+	if (typeof appId !== 'string' || !/^[a-zA-Z0-9-]+$/.test(appId)) return
+	if (!isRemoteAuthRequest(umbreld.lanIngress.remoteDomain, request.hostname)) return
+	return umbreld.lanIngress.remoteAppOrigin(appId)
 }
 
 function hostWithPort(hostname: string, port: number) {
@@ -56,8 +67,13 @@ function formActionSource(protocol: string, hostname: string, port?: number | '*
 	return `${protocol}://${formattedHost}${port === undefined ? '' : `:${port}`}`
 }
 
-async function appHandoffFormAction(umbreld: Umbreld, request: express.Request) {
+export async function appHandoffFormAction(umbreld: Umbreld, request: express.Request) {
 	if (request.protocol !== 'http' && request.protocol !== 'https') return
+
+	if (request.query.origin === 'remote') {
+		// Exact app origin, never a wildcard. Without one, keep helmet's 'self'.
+		return remoteAppOriginForRequest(umbreld, request)
+	}
 
 	const appId = request.query.app
 	if (request.query.origin === 'tor' && typeof appId === 'string' && /^[a-zA-Z0-9-]+$/.test(appId)) {
@@ -83,22 +99,27 @@ async function allowAppHandoffFormAction(umbreld: Umbreld, request: express.Requ
 	}
 }
 
-async function createHandoffResponse(umbreld: Umbreld, request: express.Request, appGatewayToken: string) {
-	const {appId, origin, redirectPath} = parseAppAuthRequest(request)
+export async function createHandoffResponse(umbreld: Umbreld, request: express.Request, appGatewayToken: string) {
+	const {appId, origin, redirectPath} = parseAppAuthRequest(umbreld, request)
 	const app = umbreld.apps.getApp(appId)
 	const manifest = await app.readManifest()
 
-	let host: string
-	if (origin === 'tor') {
-		host = (await app.readHiddenService()).trim()
+	let appOrigin: string
+	if (origin === 'remote') {
+		const remoteOrigin = remoteAppOriginForRequest(umbreld, request)
+		if (!remoteOrigin) throw new Error('App is not available on the remote domain')
+		appOrigin = remoteOrigin
+	} else if (origin === 'tor') {
+		const host = (await app.readHiddenService()).trim()
 		if (!host) throw new Error('App hidden service is unavailable')
+		appOrigin = `${request.protocol}://${host}`
 	} else {
-		host = hostWithPort(request.hostname, manifest.port)
+		appOrigin = `${request.protocol}://${hostWithPort(request.hostname, manifest.port)}`
 	}
 
 	const handoff = await umbreld.auth.issueAppHandoff(appId, appGatewayToken)
 	return {
-		url: `${request.protocol}://${host}/umbrel_/api/v1/auth/handoff`,
+		url: `${appOrigin}/umbrel_/api/v1/auth/handoff`,
 		params: {r: redirectPath, handoff},
 	}
 }

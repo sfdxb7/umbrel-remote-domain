@@ -18,6 +18,15 @@ import {
 } from '../auth/app-gateway-cookie.js'
 import {SESSION_DURATION} from '../auth/auth.js'
 import {appGatewayErrorPage} from './error-page.js'
+import safeRedirectPath from '../utilities/safe-redirect-path.js'
+import {
+	appRemoteHost,
+	normaliseHostHeader,
+	remoteAppAuthUrl,
+	remoteOriginRewrite,
+	rewriteRemoteOriginHeaders,
+	type RemoteDomain,
+} from '../lan-ingress/remote-domain.js'
 
 export type AppGatewayConfig = {
 	appId: string
@@ -36,6 +45,11 @@ export type AppGatewayConfig = {
 
 type AppGatewayOptions = {
 	onUpstreamUnavailable?: () => void
+	// Read on every request so a settings change applies without restarting the gateway.
+	getRemoteDomain?: () => RemoteDomain | undefined
+	// The origin a LAN browser uses for this app, e.g. http://umbrel.local:3015.
+	// Remote requests present this Origin/Referer to the app.
+	getLanOrigin?: () => string | undefined
 }
 
 function environmentRecord(environment: unknown) {
@@ -127,14 +141,30 @@ export function pathMatches(pathname: string, rules: string[]) {
 	})
 }
 
-function safeRedirect(value: unknown) {
-	if (typeof value !== 'string') return '/'
-	try {
-		const url = new URL(value, 'http://umbrel.local')
-		return `${url.pathname}${url.search}${url.hash}`
-	} catch {
-		return '/'
-	}
+const safeRedirect = safeRedirectPath
+
+// The host the browser used. LAN ingress forwards it as X-Forwarded-Host over
+// loopback (as Express's `trust proxy: loopback` reads it); otherwise use Host.
+function browserHost(request: http.IncomingMessage) {
+	const forwarded = request.headers['x-forwarded-host']
+	const loopback = ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(request.socket.remoteAddress ?? '')
+	if (loopback && typeof forwarded === 'string' && forwarded) return forwarded.split(',')[0]!.trim()
+	return request.headers.host
+}
+
+// When remote-domain mode is on and the request arrived on this app's own
+// remote host, return the auth-host login URL. Everything in the URL comes
+// from config; the Host header is only compared, never reflected.
+export function remoteLoginRedirect(
+	remote: RemoteDomain | undefined,
+	appId: string,
+	hostname: string | undefined,
+	originalUrl: string,
+) {
+	if (!remote) return
+	const appHost = appRemoteHost(remote, appId)
+	if (!appHost || normaliseHostHeader(hostname) !== appHost) return
+	return remoteAppAuthUrl(remote, appId, safeRedirectPath(originalUrl))
 }
 
 function hostWithPort(hostname: string, port: number) {
@@ -146,6 +176,8 @@ export default class AppGateway {
 	#umbreld: Umbreld
 	#config: AppGatewayConfig
 	#onUpstreamUnavailable?: () => void
+	#getRemoteDomain?: () => RemoteDomain | undefined
+	#getLanOrigin?: () => string | undefined
 	#proxy: ReturnType<typeof createProxyMiddleware>
 	server: http.Server
 
@@ -153,6 +185,8 @@ export default class AppGateway {
 		this.#umbreld = umbreld
 		this.#config = config
 		this.#onUpstreamUnavailable = options.onUpstreamUnavailable
+		this.#getRemoteDomain = options.getRemoteDomain
+		this.#getLanOrigin = options.getLanOrigin
 		this.#proxy = this.createProxy()
 
 		const app = express()
@@ -205,8 +239,12 @@ export default class AppGateway {
 					proxyRequest.setHeader('x-forwarded-for', request.socket.remoteAddress)
 				}
 				this.stripCookies(proxyRequest, request)
+				this.applyRemoteHeaders(proxyRequest, request)
 			},
-			onProxyReqWs: (proxyRequest, request) => this.stripCookies(proxyRequest, request),
+			onProxyReqWs: (proxyRequest, request) => {
+				this.stripCookies(proxyRequest, request)
+				this.applyRemoteHeaders(proxyRequest, request)
+			},
 			onError: (error, _request, response) => this.handleUpstreamError(response, error),
 		})
 	}
@@ -265,6 +303,27 @@ export default class AppGateway {
 		else proxyRequest.removeHeader('cookie')
 	}
 
+	// The proxy only runs after the request passed Umbrel app auth (or the app
+	// has auth off and the owner allowed it on the remote domain). On the app's
+	// own remote host, present the request to the app the way a LAN browser
+	// would: same-app Origin/Referer become the LAN origin, and X-Forwarded-*
+	// carry the public host and https.
+	private applyRemoteHeaders(proxyRequest: http.ClientRequest, request: http.IncomingMessage) {
+		const rewrite = remoteOriginRewrite(
+			this.#getRemoteDomain?.(),
+			this.#config.appId,
+			browserHost(request),
+			this.#getLanOrigin?.(),
+		)
+		if (!rewrite) return
+		proxyRequest.setHeader('x-forwarded-host', rewrite.remoteHost)
+		proxyRequest.setHeader('x-forwarded-proto', 'https')
+		if (!rewrite.lanOrigin) return
+		const headers = rewriteRemoteOriginHeaders(request.headers, rewrite.remoteOrigin, rewrite.lanOrigin)
+		if (headers.origin) proxyRequest.setHeader('origin', headers.origin)
+		if (headers.referer) proxyRequest.setHeader('referer', headers.referer)
+	}
+
 	private async isAuthorized(request: express.Request | http.IncomingMessage) {
 		if (!this.#config.auth) return
 		const pathname = new URL(request.url ?? '/', 'http://umbrel.local').pathname
@@ -295,6 +354,16 @@ export default class AppGateway {
 		try {
 			await this.isAuthorized(request)
 		} catch {
+			const remoteRedirect = remoteLoginRedirect(
+				this.#getRemoteDomain?.(),
+				this.#config.appId,
+				request.hostname,
+				request.originalUrl,
+			)
+			if (remoteRedirect) {
+				response.redirect(remoteRedirect)
+				return
+			}
 			const origin = request.hostname.endsWith('.onion') ? 'tor' : 'host'
 			const searchParams = new URLSearchParams({
 				origin,

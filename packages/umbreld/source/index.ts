@@ -8,6 +8,7 @@ const packageJson = (await import('../package.json', {assert: {type: 'json'}})).
 import {UMBREL_APP_STORE_REPO, BACKUP_RESTORE_FIRST_START_FLAG} from './constants.js'
 import createLogger, {type LogLevel} from './modules/utilities/logger.js'
 import FileStore from './modules/utilities/file-store.js'
+import type {RemoteDomainSettings} from './modules/lan-ingress/remote-domain.js'
 import Migration from './modules/startup-migrations/index.js'
 import Server from './modules/server/index.js'
 import User, {type MemberRecord} from './modules/user/user.js'
@@ -80,6 +81,8 @@ type StoreSchema = {
 		}
 		externalDns?: boolean
 		hostname?: string
+		// Opt-in remote domain mode (modules/lan-ingress/remote-domain.ts)
+		remoteDomain?: RemoteDomainSettings
 		staticIp?: Record<
 			string,
 			{

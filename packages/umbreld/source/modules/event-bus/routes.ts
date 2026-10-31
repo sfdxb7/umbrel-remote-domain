@@ -20,6 +20,8 @@ const memberAllowedEvents = new Set<(typeof events)[number]>([
 	'apps:member-shares:change',
 	// Payload-free ping; members refetch their own account-filtered list
 	'notifications:change',
+	// Payload-free ping; members refetch apps.list for their remote app links
+	'lan-ingress:remote-routes:change',
 	'photos:change',
 	'photos:indexing-progress',
 ])

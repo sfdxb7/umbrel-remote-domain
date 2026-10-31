@@ -62,6 +62,7 @@ export const events = [
 	'machines:agent-control',
 	'raid:status-change',
 	'notifications:change',
+	'lan-ingress:remote-routes:change',
 	'hardware:thunderbolt:devices-change',
 	'photos:change',
 	'photos:indexing-progress',
@@ -129,6 +130,9 @@ export type EventTypes = {
 	// no payload so it can be streamed to members; clients refetch their own
 	// account-filtered list.
 	'notifications:change': undefined
+	// Fires when the set of apps routed on the remote domain, or their auth
+	// state, changes. Payload-free so members can refetch their app links.
+	'lan-ingress:remote-routes:change': undefined
 	// Fires when the user-visible Thunderbolt device state changes
 	// e.g. connect/disconnect or an authorization/trust change
 	'hardware:thunderbolt:devices-change': undefined
