@@ -19,6 +19,16 @@ import {forwardTcp} from './forward-tcp.js'
 import {readNativeTlsPrelude} from './native-tls-preread.js'
 import {getNativeTlsPolicy, matchesNativeTlsHostname, type NativeTlsPolicy} from '../apps/native-tls.js'
 import AppGateway, {readAppGatewayConfig, type AppGatewayConfig} from '../app-gateway/app-gateway.js'
+import {
+	appRemoteHost,
+	buildAppHostMap,
+	lanAppOrigin,
+	matchRemoteHost,
+	normaliseHostHeader,
+	remotePublicPathsAllowed,
+	resolveRemoteDomain,
+	type RemoteDomain,
+} from './remote-domain.js'
 
 const NFT_BIN = '/usr/sbin/nft'
 
@@ -50,6 +60,84 @@ type UmbrelProxyOptions = {
 	includeForwardedFor?: boolean
 	pathPrefix?: string
 	redirectUnexpectedAppAuthNavigation?: boolean
+	// Only the dashboard listeners on :80/:443 dispatch remote-domain hosts.
+	remoteDomainDispatch?: boolean
+	// http-proxy-middleware subscribes itself to the server's 'upgrade' event
+	// after the first request when ws is true. Listeners that dispatch upgrades
+	// themselves must turn that off so only the chosen upstream gets the socket.
+	internalUpgradeSubscription?: boolean
+}
+
+// What the dashboard listeners should do with a request, based on its Host.
+export type RemoteDispatch =
+	| {type: 'dashboard'}
+	| {type: 'auth'}
+	| {type: 'app'; appId: string}
+	| {type: 'reject'; status: number; message: string}
+
+export type RemoteAppStatus = {
+	appId: string
+	origin: string
+	authEnabled: boolean
+	allowed: boolean
+	reachable: boolean
+	// Paths the app's manifest makes public (PROXY_AUTH_WHITELIST). On the
+	// remote domain they need the owner's per-app opt-in.
+	publicPaths: string[]
+	publicPathsAllowed: boolean
+}
+
+// Decide how a dashboard listener handles a Host. Pure so it can be unit tested.
+// - Hosts outside the remote domain (IP, LAN, mDNS, Tailscale) and the dashboard
+//   host keep today's behaviour.
+// - The auth host and app hosts are only served on the HTTPS listener, so the
+//   `__Host-` cookie, https handoff and CSP always line up.
+// - Unknown hosts under the domain get a 404 and never fall back to the dashboard.
+// - Apps with Umbrel's login turned off are refused unless explicitly allowed.
+export function remoteDispatch({
+	remote,
+	appHosts,
+	appAuth,
+	host,
+	protocol,
+	pendingHosts,
+}: {
+	remote: RemoteDomain | undefined
+	appHosts: Map<string, string>
+	appAuth: (appId: string) => boolean | undefined
+	host: string | undefined
+	protocol: 'http' | 'https'
+	// Hosts of installed gateway apps whose route is not ready yet.
+	pendingHosts?: Set<string>
+}): RemoteDispatch {
+	const match = matchRemoteHost(remote, appHosts, host)
+	if (match.type === 'outside' || match.type === 'dashboard') return {type: 'dashboard'}
+	if (match.type === 'unknown') {
+		const normalised = normaliseHostHeader(host)
+		if (protocol === 'https' && normalised && pendingHosts?.has(normalised)) {
+			return {type: 'reject', status: 503, message: 'This app is starting. This page will retry in a few seconds.'}
+		}
+		return {type: 'reject', status: 404, message: 'Not Found'}
+	}
+	if (protocol !== 'https') {
+		return {
+			type: 'reject',
+			status: 421,
+			message: 'Remote domain requests must reach Umbrel over HTTPS on port 443. See docs/remote-domain.md.',
+		}
+	}
+	if (match.type === 'auth') return {type: 'auth'}
+	const auth = appAuth(match.appId)
+	if (auth === undefined) return {type: 'reject', status: 404, message: 'Not Found'}
+	if (!auth && !remote!.allowUnauthenticatedApps.includes(match.appId)) {
+		return {
+			type: 'reject',
+			status: 403,
+			message:
+				"This app has Umbrel's login turned off, so it is blocked on the remote domain. The owner can allow it in Settings > Advanced > Remote domain.",
+		}
+	}
+	return {type: 'app', appId: match.appId}
 }
 
 type AppMuxServer = {
@@ -58,6 +146,7 @@ type AppMuxServer = {
 	httpsProxyServer?: https.Server
 	gatewayServer?: http.Server
 	loopbackServer?: net.Server
+	remoteProxy?: RequestHandler
 }
 
 type ComposeFile = {
@@ -124,6 +213,17 @@ export default class LanIngress {
 	#appAuthHttpsProxyServer?: https.Server
 	#appMuxServers = new Map<string, AppMuxServer>()
 	#appGatewayWaits = new Map<string, {target: string; controller: AbortController; ready: boolean}>()
+	// Remote-domain config is cached on refresh so per-request code never reads
+	// umbrel.yaml (FileStore re-reads the file on every get).
+	#remoteDomain?: RemoteDomain
+	#remoteAppHosts = new Map<string, string>()
+	#remoteAuthProxy?: RequestHandler
+	#remoteRoutesSignature = ''
+	// The mDNS name apps are told about (DEVICE_DOMAIN_NAME), used as the LAN
+	// origin presented to apps for remote requests.
+	#lanHostname = 'umbrel.local'
+	#stopAppEventSubscriptions?: () => void
+	#appEventRefreshTimer?: NodeJS.Timeout
 	// Track sockets at the TCP layer because Node's HTTP force-close helper does not cover
 	// upgraded/raw sockets, and the mux servers are plain net.Server instances.
 	#activeSocketsByServer = new WeakMap<net.Server | http.Server, Set<net.Socket>>()
@@ -165,6 +265,7 @@ export default class LanIngress {
 			// nftables rules exist before browser/app traffic starts flowing.
 			await this.refresh()
 			if (this.#isStopped) return
+			this.subscribeToAppEvents()
 
 			// Keep cert SANs and app-port routes converged even when IPs, Avahi names,
 			// or app state change outside the normal app lifecycle hooks.
@@ -194,6 +295,10 @@ export default class LanIngress {
 		this.#isStopped = true
 		this.#stopPeriodicRefresh?.()
 		this.#stopPeriodicRefresh = undefined
+		this.#stopAppEventSubscriptions?.()
+		this.#stopAppEventSubscriptions = undefined
+		clearTimeout(this.#appEventRefreshTimer)
+		this.#appEventRefreshTimer = undefined
 		this.#nextAppTargetRecoveryAt.clear()
 		// Let any in-flight refresh finish before cleanup. Otherwise a refresh could
 		// re-create listeners or re-apply nftables after stop() has cleared them.
@@ -299,6 +404,27 @@ export default class LanIngress {
 		return false
 	}
 
+	// App lifecycle methods already refresh LAN ingress, but remote routing must
+	// not depend on every caller remembering to. While remote-domain mode is on,
+	// any app state or settings change schedules one coalesced refresh, so
+	// installs, updates, restarts and uninstalls converge without a toggle.
+	private subscribeToAppEvents() {
+		const eventBus = this.#umbreld.eventBus
+		if (!eventBus?.on) return
+		const onChange = () => this.scheduleRemoteRefresh()
+		const unsubscribers = [eventBus.on('apps:state:change', onChange), eventBus.on('apps:settings:change', onChange)]
+		this.#stopAppEventSubscriptions = () => unsubscribers.forEach((unsubscribe) => unsubscribe())
+	}
+
+	scheduleRemoteRefresh(delayMs = 250) {
+		if (this.#isStopped || !this.#remoteDomain || this.#appEventRefreshTimer) return
+		this.#appEventRefreshTimer = setTimeout(() => {
+			this.#appEventRefreshTimer = undefined
+			this.refresh().catch((error) => this.logger.error('Failed to refresh LAN ingress after an app change', error))
+		}, delayMs)
+		this.#appEventRefreshTimer.unref?.()
+	}
+
 	// Queue a refresh of LAN ingress state; callers share the running refresh promise.
 	async refresh() {
 		if (this.#isStopped) return
@@ -331,6 +457,18 @@ export default class LanIngress {
 
 	// Rebuild certs, routes, nftables rules, and listeners from current state.
 	private async applyCurrentState() {
+		try {
+			await this.applyCurrentStateUnsafe()
+		} finally {
+			// Even when a step fails part-way, publish remote routes that match
+			// the listeners that actually exist now rather than a stale map.
+			this.updateRemoteAppHosts()
+		}
+	}
+
+	private async applyCurrentStateUnsafe() {
+		await this.loadRemoteDomain()
+		this.#lanHostname = await this.getLanHostname()
 		await fse.ensureDir(this.directory)
 		const sans = await this.getServerSans()
 		await this.ensureServerCertificate(sans)
@@ -343,6 +481,13 @@ export default class LanIngress {
 		await this.applyNftRuleset(nextAppRoutes, guardedPortMappings)
 		await this.updateListeners(nextAppRoutes)
 		await this.applyNftRuleset(nextAppRoutes)
+	}
+
+	private async getLanHostname() {
+		// Matches DEVICE_DOMAIN_NAME in the legacy app environment.
+		const hostname = await getHostname().catch(() => '')
+		const label = hostname.split('.')[0]?.toLowerCase()
+		return `${label && /^[a-z0-9-]+$/.test(label) ? label : 'umbrel'}.local`
 	}
 
 	private async getServerSans() {
@@ -787,6 +932,192 @@ export default class LanIngress {
 		await this.ensureDashboardHttpsServer()
 		await this.ensureAppAuthMuxServer()
 		await this.updateAppMuxServers(appRoutes)
+		this.updateRemoteAppHosts()
+	}
+
+	async loadRemoteDomain() {
+		const settings = await this.#umbreld.store.get('settings.remoteDomain')
+		this.#remoteDomain = resolveRemoteDomain(settings)
+		if (settings?.enabled && !this.#remoteDomain) {
+			this.logger.error('Remote domain mode is enabled but its settings are invalid; remote hosts are not routed')
+		}
+		this.updateRemoteAppHosts()
+	}
+
+	get remoteDomain() {
+		return this.#remoteDomain
+	}
+
+	// Only apps behind the app gateway get a remote host. Directly routed and
+	// non-HTTP apps stay on LAN/Tailscale ports.
+	private updateRemoteAppHosts() {
+		if (!this.#remoteDomain) {
+			this.#remoteAppHosts = new Map()
+		} else {
+			this.#remoteAppHosts = buildAppHostMap(this.#remoteDomain, this.remoteGatewayAppIds())
+		}
+		this.emitRemoteRoutesChangeIfNeeded()
+	}
+
+	// apps.list carries each app's remote URL, and gateway routes appear only
+	// after the app's container accepts connections, which is after the app's
+	// state already changed. Tell clients when the routed set really changes.
+	private emitRemoteRoutesChangeIfNeeded() {
+		const signature = JSON.stringify({
+			remote: this.#remoteDomain ?? null,
+			apps: this.remoteAppStatus(),
+		})
+		if (signature === this.#remoteRoutesSignature) return
+		const isFirst = this.#remoteRoutesSignature === ''
+		this.#remoteRoutesSignature = signature
+		if (isFirst && !this.#remoteDomain) return
+		void this.#umbreld.eventBus?.emit('lan-ingress:remote-routes:change')
+	}
+
+	// Hosts of gateway apps that are installed and running but still waiting
+	// for their container to accept connections.
+	private pendingRemoteHosts() {
+		const remote = this.#remoteDomain
+		if (!remote) return new Set<string>()
+		const pending = [...this.#appGatewayWaits.entries()]
+			.filter(([appId, wait]) => !wait.ready && !this.#appMuxServers.get(appId)?.gatewayServer)
+			.map(([appId]) => appId)
+		return new Set(buildAppHostMap(remote, pending).keys())
+	}
+
+	// Apps whose gateway is listening right now. Uninstalled and stopped apps
+	// have no mux entry, so they drop out of the remote map on the next refresh.
+	private remoteGatewayAppIds() {
+		return [...this.#appMuxServers.values()]
+			.filter((entry) => entry.gatewayServer && entry.route.gateway)
+			.map((entry) => entry.route.id)
+	}
+
+	private remoteAppAuth(appId: string) {
+		return this.#appMuxServers.get(appId)?.route.gateway?.auth
+	}
+
+	// Status of every app that could get a remote host, for the owner's settings UI.
+	remoteAppStatus(): RemoteAppStatus[] {
+		const remote = this.#remoteDomain
+		if (!remote) return []
+		return [...this.#remoteAppHosts.entries()]
+			.map(([host, appId]) => {
+				const authEnabled = this.remoteAppAuth(appId) !== false
+				const allowed = remote.allowUnauthenticatedApps.includes(appId)
+				const publicPaths = authEnabled ? (this.#appMuxServers.get(appId)?.route.gateway?.authWhitelist ?? []) : []
+				return {
+					appId,
+					origin: `https://${host}`,
+					authEnabled,
+					allowed,
+					reachable: authEnabled || allowed,
+					publicPaths,
+					publicPathsAllowed: publicPaths.length > 0 && remotePublicPathsAllowed(remote, appId),
+				}
+			})
+			.sort((a, b) => a.appId.localeCompare(b.appId))
+	}
+
+	// The https origin an app is reachable on through the remote domain, or
+	// undefined when the mode is off or the app is not routed there.
+	remoteAppOrigin(appId: string) {
+		const remote = this.#remoteDomain
+		if (!remote) return
+		const host = appRemoteHost(remote, appId)
+		if (!host || this.#remoteAppHosts.get(host) !== appId) return
+		const dispatch = remoteDispatch({
+			remote,
+			appHosts: this.#remoteAppHosts,
+			appAuth: (id) => this.remoteAppAuth(id),
+			host,
+			protocol: 'https',
+		})
+		return dispatch.type === 'app' ? `https://${host}` : undefined
+	}
+
+	private remoteDispatchFor(host: string | undefined, protocol: 'http' | 'https') {
+		return remoteDispatch({
+			remote: this.#remoteDomain,
+			appHosts: this.#remoteAppHosts,
+			appAuth: (id) => this.remoteAppAuth(id),
+			host,
+			protocol,
+			pendingHosts: this.pendingRemoteHosts(),
+		})
+	}
+
+	// Pick the upstream for a remote-domain request, or undefined for the dashboard.
+	private remoteHandler(dispatch: RemoteDispatch): RequestHandler | undefined {
+		if (dispatch.type === 'auth') {
+			// The auth host serves the app-auth SPA at its root, exactly like :2000.
+			this.#remoteAuthProxy ??= this.createProxyMiddleware(this.#umbreld.port, 'https', {
+				pathPrefix: '/app-auth',
+				internalUpgradeSubscription: false,
+			})
+			return this.#remoteAuthProxy
+		}
+		if (dispatch.type === 'app') {
+			const entry = this.#appMuxServers.get(dispatch.appId)
+			if (!entry?.gatewayServer) return
+			entry.remoteProxy ??= this.createProxyMiddleware(this.serverPort(entry.gatewayServer), 'https', {
+				includeForwardedFor: false,
+				internalUpgradeSubscription: false,
+			})
+			return entry.remoteProxy
+		}
+	}
+
+	// Returns true when the request was handled (proxied or rejected).
+	private handleRemoteRequest(
+		request: http.IncomingMessage,
+		response: http.ServerResponse,
+		protocol: 'http' | 'https',
+		upstreamPort: number,
+	) {
+		const dispatch = this.remoteDispatchFor(request.headers.host, protocol)
+		if (dispatch.type === 'dashboard') return false
+		if (dispatch.type === 'reject') {
+			response.writeHead(dispatch.status, {
+				'content-type': 'text/plain; charset=utf-8',
+				'cache-control': 'no-store',
+				'x-content-type-options': 'nosniff',
+				// A starting app retries on its own once its route is ready.
+				...(dispatch.status === 503 ? {'retry-after': '5', refresh: '5'} : {}),
+			})
+			response.end(`${dispatch.message}\n`)
+			return true
+		}
+		const handler = this.remoteHandler(dispatch)
+		if (!handler) {
+			response.writeHead(404, {'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store'})
+			response.end('Not Found\n')
+			return true
+		}
+		handler(request as any, response as any, (error?: unknown) => {
+			this.logger.verbose(`LAN ingress remote proxy error from ${upstreamPort}: ${error}`)
+			response.destroy()
+		})
+		return true
+	}
+
+	private handleRemoteUpgrade(
+		request: http.IncomingMessage,
+		socket: net.Socket,
+		head: Buffer,
+		protocol: 'http' | 'https',
+	) {
+		const dispatch = this.remoteDispatchFor(request.headers.host, protocol)
+		if (dispatch.type === 'dashboard') return false
+		const handler = dispatch.type === 'reject' ? undefined : this.remoteHandler(dispatch)
+		if (!handler?.upgrade) {
+			const status = dispatch.type === 'reject' ? dispatch.status : 404
+			socket.write(`HTTP/1.1 ${status} ${http.STATUS_CODES[status] ?? 'Error'}\r\nConnection: close\r\n\r\n`)
+			socket.destroy()
+			return true
+		}
+		handler.upgrade(request as any, socket, head)
+		return true
 	}
 
 	private async loadSecureContext() {
@@ -801,13 +1132,13 @@ export default class LanIngress {
 
 	private async ensureDashboardHttpServer() {
 		if (this.#dashboardHttpServer) return
-		this.#dashboardHttpServer = this.createHttpProxyServer(this.#umbreld.port, 'http')
+		this.#dashboardHttpServer = this.createHttpProxyServer(this.#umbreld.port, 'http', {remoteDomainDispatch: true})
 		await this.listen(this.#dashboardHttpServer, 80)
 	}
 
 	private async ensureDashboardHttpsServer() {
 		if (this.#dashboardHttpsServer) return
-		this.#dashboardHttpsServer = await this.createHttpsProxyServer(this.#umbreld.port)
+		this.#dashboardHttpsServer = await this.createHttpsProxyServer(this.#umbreld.port, {remoteDomainDispatch: true})
 		await this.listen(this.#dashboardHttpsServer, 443)
 	}
 
@@ -871,6 +1202,8 @@ export default class LanIngress {
 			if (route.gateway) {
 				gatewayServer = new AppGateway(this.#umbreld, route.gateway, {
 					onUpstreamUnavailable: () => void this.requestAppTargetRecovery(route.gateway!),
+					getRemoteDomain: () => this.#remoteDomain,
+					getLanOrigin: () => lanAppOrigin(this.#lanHostname, route.publicPort),
 				}).server
 				await this.listen(gatewayServer, 0, '127.0.0.1')
 				upstreamPort = this.serverPort(gatewayServer)
@@ -981,8 +1314,14 @@ export default class LanIngress {
 		originalProtocol: 'http' | 'https',
 		options: UmbrelProxyOptions = {},
 	) {
-		const middleware = this.createProxyMiddleware(upstreamPort, originalProtocol, options)
+		const middleware = this.createProxyMiddleware(upstreamPort, originalProtocol, {
+			...options,
+			internalUpgradeSubscription: !options.remoteDomainDispatch,
+		})
 		const server = http.createServer((request, response) => {
+			if (options.remoteDomainDispatch && this.handleRemoteRequest(request, response, originalProtocol, upstreamPort)) {
+				return
+			}
 			if (options.redirectUnexpectedAppAuthNavigation) {
 				const redirect = appAuthDashboardRedirect({
 					protocol: originalProtocol,
@@ -1006,19 +1345,26 @@ export default class LanIngress {
 		// Let umbreld and upstream apps enforce their own upload deadlines.
 		// Keep the separate timeout for receiving request headers.
 		server.requestTimeout = 0
-		this.attachProxyUpgradeHandler(server, middleware)
+		this.attachProxyUpgradeHandler(server, middleware, options.remoteDomainDispatch ? originalProtocol : undefined)
 		return server
 	}
 
 	private async createHttpsProxyServer(upstreamPort: number, options: UmbrelProxyOptions = {}) {
 		const {includeForwardedFor = true, pathPrefix} = options
-		const middleware = this.createProxyMiddleware(upstreamPort, 'https', {includeForwardedFor, pathPrefix})
+		const middleware = this.createProxyMiddleware(upstreamPort, 'https', {
+			includeForwardedFor,
+			pathPrefix,
+			internalUpgradeSubscription: !options.remoteDomainDispatch,
+		})
 		const server = https.createServer(
 			{
 				cert: await fse.readFile(this.serverCertificatePath),
 				key: await fse.readFile(this.serverKeyPath),
 			},
 			(request, response) => {
+				if (options.remoteDomainDispatch && this.handleRemoteRequest(request, response, 'https', upstreamPort)) {
+					return
+				}
 				if (options.redirectUnexpectedAppAuthNavigation) {
 					const redirect = appAuthDashboardRedirect({
 						protocol: 'https',
@@ -1043,14 +1389,14 @@ export default class LanIngress {
 		// Let umbreld and upstream apps enforce their own upload deadlines.
 		// Keep the separate timeout for receiving request headers.
 		server.requestTimeout = 0
-		this.attachProxyUpgradeHandler(server, middleware)
+		this.attachProxyUpgradeHandler(server, middleware, options.remoteDomainDispatch ? 'https' : undefined)
 		return server
 	}
 
 	private createProxyMiddleware(
 		upstreamPort: number,
 		originalProtocol: 'http' | 'https',
-		{includeForwardedFor = true, pathPrefix}: UmbrelProxyOptions = {},
+		{includeForwardedFor = true, pathPrefix, internalUpgradeSubscription = true}: UmbrelProxyOptions = {},
 	): RequestHandler {
 		const rewritePath = pathPrefix
 			? (path: string) =>
@@ -1061,7 +1407,9 @@ export default class LanIngress {
 		return createProxyMiddleware({
 			target: `http://127.0.0.1:${upstreamPort}`,
 			changeOrigin: false,
-			ws: true,
+			// Upgrades still work with ws false: attachProxyUpgradeHandler calls
+			// middleware.upgrade, which proxies the socket either way.
+			ws: internalUpgradeSubscription,
 			pathRewrite: rewritePath,
 			// Umbrel-owned upstreams (dashboard, app-auth) get X-Forwarded-For since they
 			// only trust it from loopback. App upstreams must not: some apps reject any
@@ -1107,8 +1455,17 @@ export default class LanIngress {
 		})
 	}
 
-	private attachProxyUpgradeHandler(server: http.Server, middleware: RequestHandler) {
-		server.on('upgrade', (request, socket, head) => middleware.upgrade?.(request as any, socket as net.Socket, head))
+	private attachProxyUpgradeHandler(
+		server: http.Server,
+		middleware: RequestHandler,
+		remoteDomainProtocol?: 'http' | 'https',
+	) {
+		server.on('upgrade', (request, socket, head) => {
+			if (remoteDomainProtocol && this.handleRemoteUpgrade(request, socket as net.Socket, head, remoteDomainProtocol)) {
+				return
+			}
+			middleware.upgrade?.(request as any, socket as net.Socket, head)
+		})
 	}
 
 	private serverPort(server: net.Server | http.Server) {

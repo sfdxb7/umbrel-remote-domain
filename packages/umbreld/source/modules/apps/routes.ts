@@ -126,6 +126,9 @@ export const apps = router({
 							showBeforeOpen: showCredentialsBeforeOpen,
 						},
 						hiddenService,
+						// https origin on the remote domain, only when that mode is on and
+						// the app is routed there.
+						remoteUrl: ctx.umbreld.lanIngress.remoteAppOrigin(app.id),
 						widgets,
 						dependencies,
 						selectedDependencies,
