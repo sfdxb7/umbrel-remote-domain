@@ -18,8 +18,8 @@ Sign in as the owner and open **Settings → Advanced → Remote domain**:
 
 1. Enter the base domain, for example `example.com`. If no base domain has been saved and you opened the dashboard on a domain name, the field is pre-filled with a suggestion: the current hostname with its first label dropped (`umbrel.example.com` → `example.com`). Check it before saving. The suggestion never turns the mode on. No suggestion is made for IP addresses, `localhost`, `*.local`, `*.ts.net`, `.onion`, other private-use suffixes (`.internal`, `.lan`, `.home`, `.test`), or one- and two-label hosts.
 2. Turn on **Enable remote domain** and save.
-3. Optional: the **Advanced** section holds the dashboard subdomain (`umbrel`), auth subdomain (`umbrel-auth`), app subdomain template (`{app}-umbrel`) and the Origin rewrite opt-out. The defaults are fine for most setups.
-4. Optional: allow individual apps that have Umbrel login turned off (see below).
+3. Optional: the **Advanced** section holds the dashboard subdomain (`umbrel`), auth subdomain (`umbrel-auth`), app subdomain template (`{app}-umbrel`), the Origin rewrite opt-out, the trusted proxies and the client IP header (see "Client IP and trusted proxies"). The defaults are fine for most setups.
+4. Optional: allow individual apps that have Umbrel login turned off, or allow an app's public paths remotely (see below).
 
 Saving applies immediately, with no restart. The same setting is available over tRPC as `lanIngress.setRemoteDomain` (owner only), for example `{enabled: true, baseDomain: "example.com"}`. `lanIngress.getRemoteDomain` can be read by any account. Only the owner also sees the per-app allow list and app status. The settings are stored in `umbrel.yaml` under `settings.remoteDomain`.
 
@@ -62,22 +62,173 @@ Any reverse proxy or tunnel works if it:
 
 1. **Terminates TLS** for `umbrel.<domain>`, `umbrel-auth.<domain>` and `*-umbrel.<domain>`. The default names are all one level below the base domain, so a single wildcard certificate for `*.<domain>` covers them.
 2. **Forwards to umbreld's port 443 over HTTPS** and **skips upstream certificate verification**. umbreld presents its own local-CA certificate, which does not match the public name.
-3. **Passes the original `Host` header through.**
+3. **Passes the original `Host` header through.** Caddy and Traefik do this by default.
 4. Supports WebSockets (the dashboard and many apps use them).
+5. **Forwards only hosts under the base domain** to umbreld. Restrict the proxy rule to the hosts above if other services share the domain.
 
-DNS: point a wildcard record `*.<domain>` (or `umbrel`, `umbrel-auth` plus one record per app) at the proxy. Unknown hosts under the base domain get a 404 from umbreld, so a wildcard record is safe. Restrict the proxy rule to the hosts above if other services share the domain.
+DNS: a public wildcard record `*.<domain>` pointing at the proxy covers the dashboard host, the auth host and every app host. You can instead create `umbrel`, `umbrel-auth` and one record per app. Unknown hosts under the base domain get a 404 from umbreld, so a wildcard record is safe.
 
-## Exposure
+## Self-hosted proxy (no CDN or tunnel needed)
 
-- Only the reverse proxy should be able to reach umbreld's port 443. Do not expose ports 80, 443 or 2000 to the internet directly.
-- App ports (for example `8085`) are published directly and bypass this mode. Block them at the firewall and use LAN or Tailscale for port access.
-- umbreld does not rate-limit login attempts in this mode. Add rate limiting at the proxy for `POST /trpc/user.login*` on the dashboard host and `POST /v1/account/login*` on the auth host. Consider turning on 2FA for every account.
+You do not need a CDN or a tunnel service. A server with a public IP, a domain whose DNS provider has an API, and Caddy or Traefik is enough.
+
+### DNS
+
+At your DNS provider, point these records at the server's public IP:
+
+| Record | Type | Value |
+| --- | --- | --- |
+| `*.example.com` | `A` (and `AAAA` for IPv6) | the server's public IP |
+
+The wildcard already covers `umbrel.example.com`, `umbrel-auth.example.com` and `<app>-umbrel.example.com`. If you prefer explicit records, add `umbrel` and `umbrel-auth` plus one per app.
+
+A wildcard certificate from Let's Encrypt needs the **DNS-01 challenge**, so the proxy needs an API token for your DNS provider. The examples below use Hetzner DNS. Any provider with a Caddy DNS module or a Traefik (lego) DNS provider works the same way; only the provider name and credential variable change.
+
+### Caddy
+
+Caddy needs a build that includes your DNS provider's module, for example `xcaddy build --with github.com/caddy-dns/hetzner/v2`, or the matching package from the Caddy download page. Then:
+
+```caddyfile
+*.example.com {
+	tls {
+		dns hetzner {env.HETZNER_API_TOKEN}
+	}
+
+	reverse_proxy https://umbrel:443 {
+		transport http {
+			tls_insecure_skip_verify
+		}
+	}
+}
+```
+
+- `umbrel:443` is umbreld's HTTPS listener. Use the container name when Caddy shares a Docker network with umbrelOS, or `127.0.0.1:443` / a private IP otherwise.
+- Every host under `example.com` goes to umbreld, which answers 404 for names it does not serve. If other services share the domain, give them their own site blocks (`foo.example.com { ... }`); since Caddy 2.10 they reuse the wildcard certificate.
+- Caddy keeps the original `Host` header. It ignores `X-Forwarded-For` values sent by clients and sets its own with the real client address, so no header settings are needed.
+- `tls_insecure_skip_verify` only affects the Caddy → umbreld hop, where umbreld uses its own local CA.
+
+### Traefik (v3)
+
+Static configuration (`traefik.yml`):
+
+```yaml
+entryPoints:
+  websecure:
+    address: ":443"
+
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+
+certificatesResolvers:
+  letsencrypt:
+    acme:
+      email: admin@example.com
+      storage: /letsencrypt/acme.json
+      dnsChallenge:
+        provider: hetzner # reads HETZNER_API_TOKEN from the environment
+```
+
+Dynamic configuration (`dynamic.yml`):
+
+```yaml
+http:
+  routers:
+    umbrel:
+      rule: "Host(`umbrel.example.com`) || Host(`umbrel-auth.example.com`) || HostRegexp(`^[a-z0-9-]+-umbrel\\.example\\.com$`)"
+      entryPoints: [websecure]
+      service: umbrel
+      tls:
+        certResolver: letsencrypt
+        domains:
+          - main: "*.example.com"
+
+  services:
+    umbrel:
+      loadBalancer:
+        serversTransport: umbrel-local-ca
+        servers:
+          - url: "https://umbrel:443"
+
+  serversTransports:
+    umbrel-local-ca:
+      insecureSkipVerify: true # umbreld uses its own local CA on :443
+```
+
+Traefik passes the original `Host` header by default (`passHostHeader` defaults to `true`) and sets `X-Forwarded-For` to include the client address. On Traefik v2, write the app rule as ``HostRegexp(`{app:[a-z0-9-]+}-umbrel.example.com`)``.
+
+### Firewall
+
+- **Only 443 should be public.** Allow inbound TCP 443 (and 80 only if you redirect HTTP to HTTPS at the proxy). Nothing else needs to be reachable from the internet. DNS-01 does not need port 80.
+- **Do not publish umbreld's or the apps' ports.** Docker-published ports (`ports:` in Compose, `-p` on the command line) are inserted into iptables ahead of `ufw`'s rules, so `ufw deny` does **not** block them. Keep umbrelOS on a private Docker network that only the proxy joins, or bind any published port to `127.0.0.1`. If you must publish a port, filter it in the `DOCKER-USER` chain or your hosting provider's firewall.
+- Use LAN or Tailscale for port-based app access (`http://<host>:<app port>`).
+
+### Login protection
+
+umbreld throttles password logins itself (see "Login backoff" below), so it is protected even when the proxy has no rate limiting configured. Proxy rate limits are still a good extra layer.
+
+For a second login wall in front of everything, you can put [Authelia](https://www.authelia.com/) or [Authentik](https://goauthentik.io/) in front of the proxy route as forward auth. This is optional. Some apps' API clients (mobile and desktop sync apps) cannot pass such a wall, so exempt their paths or hosts if they break.
+
+## Security on the remote domain
+
+The remote domain is reachable from the whole internet, so some behaviour there is stricter than on the LAN. LAN, IP, Tor and Tailscale requests keep upstream behaviour unless noted.
+
+### Login backoff
+
+Password logins are throttled with exponential backoff, on every host:
+
+- **Per account:** 5 failed attempts are free, then the account is locked for 2 s, doubling with each further failure up to 15 minutes.
+- **Per client IP:** 10 failed attempts across any accounts are free, then the IP is locked for 2 s, doubling up to 1 hour. This stops one address from spraying passwords over many accounts.
+- It covers the dashboard login, including the 2FA step, and the app login on the auth host. A wrong password or a wrong 2FA code counts as a failure. A correct password sent without a 2FA code (the step that makes the 2FA prompt appear) does not.
+- Attempts are counted when they start, so parallel guesses cannot race past the limit. A locked login gets HTTP `429` with `Retry-After` and no password check runs.
+- Remote-domain and LAN failures for the same account are counted separately, so an internet attacker cannot lock the owner out of the LAN.
+- A successful login clears the counters for that account and IP. Counters reset after 24 hours without failures and are kept in memory only.
+
+Batched tRPC requests that contain a login, registration or other auth procedure are rejected with `400`, so a single HTTP request cannot carry many password guesses. Batching still works for everything else.
+
+### Client IP and trusted proxies
+
+The per-IP limit needs the real client address. umbreld works it out like this:
+
+1. Start from the TCP peer that connected to port 443, skipping umbreld's own internal ingress hop.
+2. On the LAN, or if that peer is not a trusted proxy, the peer is the client. `X-Forwarded-For` is ignored, so a client that reaches umbreld directly cannot choose its own address.
+3. On the remote domain, if the peer is a trusted proxy, umbreld walks `X-Forwarded-For` from the right and skips trusted proxies. The first untrusted address is the client. Entries a client prepends cannot override what the proxy appended.
+
+**Trusted proxies** default to loopback and private networks (`127.0.0.0/8`, `::1`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`). That fits a proxy on the same host or Docker network. Change the list under **Advanced → Trusted proxies** (comma separated IPs or CIDR ranges).
+
+If a CDN or another proxy sits in front of your own proxy, its edge addresses arrive in `X-Forwarded-For` too. Either add the CDN's published IP ranges to the trusted proxies, or set **Advanced → Client IP header** to the header your CDN sets with the visitor address. umbreld only reads that header when the request came through a trusted proxy. Only use it if the origin is reachable through the CDN alone; otherwise anyone can set that header.
+
+If this is set up wrong, every remote visitor appears to come from the proxy's address. Then they all share one IP counter, and a few wrong passwords lock everyone out for up to an hour. After setup, check that failed logins from two different networks are counted separately.
+
+### No account enumeration
+
+On the remote domain, unauthenticated callers cannot tell which accounts exist:
+
+- the account list on the login pages is empty, and the login form has an **account name** field instead of an account picker (leave it empty for the owner; names are matched case-insensitively);
+- `user.exists` always answers `true`, and `user.is2faEnabled` always answers `false` (the 2FA prompt appears after a correct password);
+- registering a new account is refused (`403`), so create accounts from the LAN or while signed in;
+- an unknown username takes as long as a wrong password, because a dummy hash is checked;
+- the app login API only answers on the auth host (other remote hosts get `404`), and it gives the same `404` for an unknown app and for an app that is not routed remotely.
+
+Signed-in users see the normal account list. On the LAN everything works as upstream.
+
+### Public app paths
+
+Some app manifests mark paths as public (`PROXY_AUTH_WHITELIST`), so they skip Umbrel login. Those lists were written for the LAN. On the remote domain they would be open to the internet, so **they are ignored there by default** and every path needs Umbrel login.
+
+If an app's clients need those paths (for example a mobile sync API), the owner can allow them for that app: each app card in the remote domain settings lists the app's public paths with an **Allow public paths on the remote domain** switch (off by default) and a warning. The manifest's blacklist (`PROXY_AUTH_BLACKLIST`) still applies. LAN behaviour is unchanged.
+
+### Headers
+
+- The login page's CSP `form-action` never falls back to a wildcard on remote hosts.
+- Responses from the dashboard server send `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
+
+The settings page warns the owner when 2FA is off. Turning on 2FA for every account is strongly recommended.
 
 ## Known limits
 
-- HSTS is not sent by umbreld. Enable it at the proxy if you want it.
 - Apps without an app gateway, and non-HTTP ports, are not routed on the remote domain.
-- App paths that an app's manifest whitelists from Umbrel login stay public on its remote host, same as on the LAN.
 - Home-screen shortcuts, widgets and the MCP `get_app_details` URL still use port URLs.
-- umbreld does not trust `X-Forwarded-*` headers from the proxy. The secure context comes from the proxy → :443 hop being HTTPS.
+- `X-Forwarded-For` is only used to find the client address for login throttling. The secure context comes from the proxy → :443 hop being HTTPS, not from `X-Forwarded-Proto`.
+- Login throttling state is kept in memory, so it resets when umbreld restarts.
 - Upstream apps see a LAN `Origin`/`Referer` with the remote `Host` (see the per-app override above).
