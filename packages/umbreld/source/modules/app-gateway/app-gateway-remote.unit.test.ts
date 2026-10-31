@@ -127,15 +127,18 @@ describe('app gateway remote Origin/Referer rewrite', () => {
 			server.close(() => resolve())
 		})
 
-	// Upstream app that echoes the headers it received, for HTTP and upgrades.
-	async function startUpstream() {
+	// Upstream app that records the headers it received, for HTTP and upgrades.
+	// `allow` models the app's own origin check.
+	async function startUpstream({allow = (_headers: http.IncomingHttpHeaders): boolean => true} = {}) {
 		const seen: http.IncomingHttpHeaders[] = []
 		const upstream = http.createServer((request, response) => {
 			seen.push(request.headers)
+			if (!allow(request.headers)) return response.writeHead(403).end('cross_origin')
 			response.end('ok')
 		})
 		upstream.on('upgrade', (request, socket) => {
 			seen.push(request.headers)
+			if (!allow(request.headers)) return socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n')
 			socket.end('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
 		})
 		upstream.listen(0, '127.0.0.1')
@@ -182,14 +185,37 @@ describe('app gateway remote Origin/Referer rewrite', () => {
 		...extra,
 	})
 
-	function get(port: number, headers: Record<string, string>) {
-		return new Promise<void>((resolve, reject) => {
+	function get(port: number, headers: Record<string, string>, method = 'GET') {
+		return new Promise<http.IncomingMessage>((resolve, reject) => {
 			http
-				.get({host: '127.0.0.1', port, path: '/api/chat?x=1', headers}, (response) => {
+				.request({host: '127.0.0.1', port, method, path: '/api/chat?x=1', headers}, (response) => {
 					response.resume()
-					response.on('end', resolve)
+					response.on('end', () => resolve(response))
 				})
 				.on('error', reject)
+				.end()
+		})
+	}
+
+	// Resolves with 101 for a completed upgrade, or the status of a refusal.
+	function upgradeStatus(port: number, headers: Record<string, string>) {
+		return new Promise<number>((resolve, reject) => {
+			const request = http.request({
+				host: '127.0.0.1',
+				port,
+				path: '/ws',
+				headers: {...headers, connection: 'Upgrade', upgrade: 'websocket'},
+			})
+			request.on('upgrade', (_response, socket) => {
+				socket.destroy()
+				resolve(101)
+			})
+			request.on('response', (response) => {
+				response.resume()
+				resolve(response.statusCode!)
+			})
+			request.on('error', reject)
+			request.end()
 		})
 	}
 
@@ -216,6 +242,7 @@ describe('app gateway remote Origin/Referer rewrite', () => {
 		const port = await startGateway(upstream.port, () => remote)
 		await get(port, remoteHeaders({origin: `https://${remoteHost}`, referer: `https://${remoteHost}/chat/1?tab=files`}))
 		expect(upstream.seen[0]).toMatchObject({
+			host: 'umbrel.local:3015',
 			origin: 'http://umbrel.local:3015',
 			referer: 'http://umbrel.local:3015/chat/1?tab=files',
 			'x-forwarded-host': remoteHost,
@@ -228,6 +255,7 @@ describe('app gateway remote Origin/Referer rewrite', () => {
 		const port = await startGateway(upstream.port, () => remote)
 		await upgrade(port, remoteHeaders({origin: `https://${remoteHost}`}))
 		expect(upstream.seen[0]).toMatchObject({
+			host: 'umbrel.local:3015',
 			origin: 'http://umbrel.local:3015',
 			'x-forwarded-host': remoteHost,
 			'x-forwarded-proto': 'https',
@@ -260,7 +288,7 @@ describe('app gateway remote Origin/Referer rewrite', () => {
 			'x-forwarded-proto': 'http',
 			origin: `https://${remoteHost}`,
 		})
-		expect(upstream.seen[0].origin).toBe(`https://${remoteHost}`)
+		expect(upstream.seen[0]).toMatchObject({host: 'umbrel.local:3015', origin: `https://${remoteHost}`})
 
 		const optedOut = resolveRemoteDomain({
 			enabled: true,
@@ -269,7 +297,126 @@ describe('app gateway remote Origin/Referer rewrite', () => {
 		})!
 		const optedOutPort = await startGateway(upstream.port, () => optedOut)
 		await get(optedOutPort, remoteHeaders({origin: `https://${remoteHost}`}))
-		expect(upstream.seen[1]).toMatchObject({origin: `https://${remoteHost}`, 'x-forwarded-host': remoteHost})
+		expect(upstream.seen[1]).toMatchObject({
+			host: remoteHost,
+			origin: `https://${remoteHost}`,
+			'x-forwarded-host': remoteHost,
+		})
+	})
+
+	// A common same-host CSRF guard: the Origin host must equal Host or X-Forwarded-Host.
+	const sameHostOrigin = (headers: http.IncomingHttpHeaders) => {
+		if (!headers.origin) return true
+		const originHost = new URL(headers.origin).host
+		return originHost === headers.host || originHost === headers['x-forwarded-host']
+	}
+
+	test('passes apps that require the Origin host to match Host or X-Forwarded-Host', async () => {
+		const upstream = await startUpstream({allow: sameHostOrigin})
+		const port = await startGateway(upstream.port, () => remote)
+		const origin = `https://${remoteHost}`
+		expect((await get(port, remoteHeaders({origin}), 'POST')).statusCode).toBe(200)
+		expect(await upgradeStatus(port, remoteHeaders({origin}))).toBe(101)
+		// Cross-site requests are still refused by the app
+		expect((await get(port, remoteHeaders({origin: 'https://evil.com'}), 'POST')).statusCode).toBe(403)
+		expect(await upgradeStatus(port, remoteHeaders({origin: 'https://immich-umbrel.example.com'}))).toBe(403)
+	})
+
+	// Agent Zero and many others compare Origin with a LAN allowlist built from
+	// DEVICE_DOMAIN_NAME, which is why the gateway presents the LAN origin.
+	test('still passes apps that only allow their LAN origins', async () => {
+		const lanAllowlist = (headers: http.IncomingHttpHeaders) =>
+			['http://umbrel.local:3015', 'http://localhost:3015'].includes(String(headers.origin))
+		const upstream = await startUpstream({allow: lanAllowlist})
+		const port = await startGateway(upstream.port, () => remote)
+		expect((await get(port, remoteHeaders({origin: `https://${remoteHost}`}), 'POST')).statusCode).toBe(200)
+		expect(await upgradeStatus(port, remoteHeaders({origin: `https://${remoteHost}`}))).toBe(101)
+		expect((await get(port, remoteHeaders({origin: 'https://evil.com'}), 'POST')).statusCode).toBe(403)
+	})
+
+	// Upstream app configured with a LAN URL, e.g. APP_URL=http://umbrel.local:7455.
+	// The test passes the response headers it wants; PORT is the upstream port.
+	async function startRedirectingUpstream() {
+		const upstream = http.createServer((request, response) => {
+			const port = String((upstream.address() as net.AddressInfo).port)
+			const headers = JSON.parse(String(request.headers['x-test-response'])) as Record<string, string | string[]>
+			const resolved = JSON.parse(JSON.stringify(headers).replaceAll('PORT', port))
+			response.writeHead(302, resolved).end()
+		})
+		upstream.listen(0, '127.0.0.1')
+		await once(upstream, 'listening')
+		closers.push(close(upstream))
+		return (upstream.address() as net.AddressInfo).port
+	}
+
+	const respondWith = (headers: Record<string, string | string[]>) => ({'x-test-response': JSON.stringify(headers)})
+
+	test('points redirects to the app local address at its remote origin', async () => {
+		const upstreamPort = await startRedirectingUpstream()
+		const port = await startGateway(upstreamPort, () => remote)
+		const cases = [
+			['http://umbrel.local:3015/signin?callbackUrl=%2Fchat', `https://${remoteHost}/signin?callbackUrl=%2Fchat`],
+			['http://UMBREL:3015/', `https://${remoteHost}/`],
+			['http://192.168.1.10:3015/x', `https://${remoteHost}/x`],
+			['https://localhost:3015/x#y', `https://${remoteHost}/x#y`],
+			['//umbrel.local:3015/x', `https://${remoteHost}/x`],
+			['http://agent-zero_web_1:PORT/x?y=1', `https://${remoteHost}/x?y=1`],
+			['http://127.0.0.1:PORT/x', `https://${remoteHost}/x`],
+			// Other apps, foreign hosts and relative URLs are left alone
+			['http://umbrel.local:2000/login', 'http://umbrel.local:2000/login'],
+			['http://umbrel.local:PORT/login', `http://umbrel.local:${upstreamPort}/login`],
+			['https://evil.com/x', 'https://evil.com/x'],
+			['/signin?x=1', '/signin?x=1'],
+		]
+		for (const [location, expected] of cases) {
+			const response = await get(port, remoteHeaders(respondWith({location: location!})))
+			expect(response.headers.location).toBe(expected)
+		}
+	})
+
+	test('rewrites Refresh and drops LAN cookie domains on the remote host', async () => {
+		const upstreamPort = await startRedirectingUpstream()
+		const port = await startGateway(upstreamPort, () => remote)
+		const response = await get(
+			port,
+			remoteHeaders(
+				respondWith({
+					refresh: '0; url=http://umbrel.local:3015/signin',
+					'set-cookie': [
+						'a=1; Domain=umbrel.local; Path=/; HttpOnly',
+						'b=2; Domain=example.org; Path=/',
+						'c=3; Path=/',
+					],
+				}),
+			),
+		)
+		expect(response.headers.refresh).toBe(`0; url=https://${remoteHost}/signin`)
+		expect(response.headers['set-cookie']).toEqual([
+			'a=1; Path=/; HttpOnly',
+			'b=2; Domain=example.org; Path=/',
+			'c=3; Path=/',
+		])
+	})
+
+	test('rewrites redirects for opted-out apps but never for LAN requests', async () => {
+		const upstreamPort = await startRedirectingUpstream()
+		const optedOut = resolveRemoteDomain({
+			enabled: true,
+			baseDomain: 'example.com',
+			originRewriteDisabledApps: ['agent-zero'],
+		})!
+		const optedOutPort = await startGateway(upstreamPort, () => optedOut)
+		const headers = respondWith({location: 'http://umbrel.local:3015/signin'})
+		expect((await get(optedOutPort, remoteHeaders(headers))).headers.location).toBe(`https://${remoteHost}/signin`)
+
+		const port = await startGateway(upstreamPort, () => remote)
+		const lan = await get(port, {
+			host: 'umbrel.local:3015',
+			'x-forwarded-host': 'umbrel.local:3015',
+			'x-forwarded-proto': 'http',
+			...headers,
+		})
+		expect(lan.headers.location).toBe('http://umbrel.local:3015/signin')
 	})
 })
 

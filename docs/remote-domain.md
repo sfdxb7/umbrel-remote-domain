@@ -18,7 +18,7 @@ Sign in as the owner and open **Settings → Advanced → Remote domain**:
 
 1. Enter the base domain, for example `example.com`. If no base domain has been saved and you opened the dashboard on a domain name, the field is pre-filled with a suggestion: the current hostname with its first label dropped (`umbrel.example.com` → `example.com`). Check it before saving. The suggestion never turns the mode on. No suggestion is made for IP addresses, `localhost`, `*.local`, `*.ts.net`, `.onion`, other private-use suffixes (`.internal`, `.lan`, `.home`, `.test`), or one- and two-label hosts.
 2. Turn on **Enable remote domain** and save.
-3. Optional: the **Advanced** section holds the dashboard subdomain (`umbrel`), auth subdomain (`umbrel-auth`), app subdomain template (`{app}-umbrel`), the Origin rewrite opt-out, the trusted proxies and the client IP header (see "Client IP and trusted proxies"). The defaults are fine for most setups.
+3. Optional: the **Advanced** section holds the dashboard subdomain (`umbrel`), auth subdomain (`umbrel-auth`), app subdomain template (`{app}-umbrel`), the Host and Origin rewrite opt-out, the trusted proxies and the client IP header (see "Client IP and trusted proxies"). The defaults are fine for most setups.
 4. Optional: allow individual apps that have Umbrel login turned off, or allow an app's public paths remotely (see below).
 
 Saving applies immediately, with no restart. The same setting is available over tRPC as `lanIngress.setRemoteDomain` (owner only), for example `{enabled: true, baseDomain: "example.com"}`. `lanIngress.getRemoteDomain` can be read by any account. Only the owner also sees the per-app allow list and app status. The settings are stored in `umbrel.yaml` under `settings.remoteDomain`.
@@ -46,15 +46,23 @@ Routing follows apps automatically. You never need to turn the mode off and on.
 
 ### Origin and Referer rewrite
 
-Some apps only accept requests whose `Origin` matches the LAN URL they expect, and reject `https://<app>-umbrel.example.com`. For remote-domain requests that have passed Umbrel app login (or that come from an app the owner allowed without login), the app gateway:
+Apps check the browser `Origin` in two common ways, and both reject `https://<app>-umbrel.example.com` out of the box:
 
-- rewrites `Origin: https://<appId>-umbrel.<domain>` to `http://<device hostname>.local:<app port>` (`umbrel.local` by default), for HTTP requests and WebSocket upgrades;
-- rewrites a `Referer` on that same origin to the LAN origin, keeping its path and query;
-- sets `X-Forwarded-Host: <appId>-umbrel.<domain>` and `X-Forwarded-Proto: https`.
+- against a list of LAN URLs Umbrel hands them, for example `http://umbrel.local:3015` (Django `CSRF_TRUSTED_ORIGINS`, better-auth `AUTH_TRUSTED_ORIGINS`, SvelteKit `ORIGIN`, or an app's own `ALLOWED_ORIGINS`);
+- by requiring the `Origin` host to equal `Host` or `X-Forwarded-Host` (a common CSRF and WebSocket check).
 
-Only an exact match on the app's own remote origin is rewritten. Foreign origins and other apps' origins reach the app unchanged, so the app's own cross-origin protection still works. Requests with no `Origin` are left alone. `Host` is **not** rewritten, so apps that build absolute URLs from `Host` keep producing remote URLs. LAN, IP and Tailscale requests are never rewritten.
+For remote-domain requests that have passed Umbrel app login (or that come from an app the owner allowed without login), the app gateway therefore presents the request the way a LAN browser sends it:
 
-**Per-app override.** An app that compares `Origin` with `Host` (some WebSocket servers do this by default) will see them differ after the rewrite. For such apps, add the app ID under **Advanced → Send the original Origin header to these apps**, or over tRPC with `originRewriteDisabledApps: ["some-app"]`. Those apps still get `X-Forwarded-Host`/`X-Forwarded-Proto`, but their `Origin` and `Referer` pass through unchanged.
+- `Host` becomes `<device hostname>.local:<app port>` (`umbrel.local` by default);
+- `Origin: https://<appId>-umbrel.<domain>` becomes `http://<device hostname>.local:<app port>`, for HTTP requests and WebSocket upgrades;
+- a `Referer` on that same origin becomes the LAN origin, keeping its path and query;
+- `X-Forwarded-Host: <appId>-umbrel.<domain>` and `X-Forwarded-Proto: https` are set, so apps that build URLs from them still produce remote URLs.
+
+`Host` and `Origin` are always rewritten together, so a same-app request passes both kinds of check. Only an exact match on the app's own remote origin is rewritten. Foreign origins and other apps' origins reach the app unchanged and still fail both checks. Requests with no `Origin` are left alone apart from `Host`. LAN, IP and Tailscale requests are never rewritten.
+
+**Redirects.** Apps configured with a LAN URL (for example `APP_URL=http://umbrel.local:7455`) redirect to it, which does not work from the internet. On an app's remote host the gateway rewrites a response `Location` or `Refresh` URL that points at the app itself to `https://<appId>-umbrel.<domain>`, keeping path and query. "The app itself" means the LAN hostname (with or without `.local`), a private or loopback IP or `localhost` on the app's LAN port, or the app container's host or address on its internal port. Relative URLs, other ports (other apps) and public hosts are left alone. A `Set-Cookie` `Domain` attribute naming a local hostname is dropped, so the cookie becomes host-only on the remote host. This also applies to apps under the per-app override.
+
+**Per-app override.** Apps that compare `Origin` with `X-Forwarded-Host` before `Host` (for example Next.js server actions and Rails), or that build page URLs from the raw `Host`, should get the browser's original headers. Add the app ID under **Advanced → Send the original Host and Origin headers to these apps**, or over tRPC with `originRewriteDisabledApps: ["some-app"]`. Those apps get the original `Host`, `Origin` and `Referer`, plus `X-Forwarded-Host`/`X-Forwarded-Proto`. The setting keeps its `originRewriteDisabledApps` name for compatibility.
 
 ## Reverse proxy requirements
 
@@ -231,4 +239,5 @@ The settings page warns the owner when 2FA is off. Turning on 2FA for every acco
 - Home-screen shortcuts, widgets and the MCP `get_app_details` URL still use port URLs.
 - `X-Forwarded-For` is only used to find the client address for login throttling. The secure context comes from the proxy → :443 hop being HTTPS, not from `X-Forwarded-Proto`.
 - Login throttling state is kept in memory, so it resets when umbreld restarts.
-- Upstream apps see a LAN `Origin`/`Referer` with the remote `Host` (see the per-app override above).
+- Upstream apps see a LAN `Host`/`Origin`/`Referer`. Apps that build absolute URLs in page bodies from the raw `Host` (instead of `X-Forwarded-Host`) produce LAN URLs; redirects are fixed up, page bodies are not. Use the per-app override for such apps.
+- Only the app's main port is routed. Extra ports an app hands to the browser (for example a separate S3 or gateway port) stay LAN-only.

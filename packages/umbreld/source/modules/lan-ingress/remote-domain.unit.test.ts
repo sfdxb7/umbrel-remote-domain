@@ -14,6 +14,9 @@ import {
 	remoteOriginRewrite,
 	resolveRemoteDomain,
 	rewriteRemoteOriginHeaders,
+	rewriteLocalAppUrl,
+	rewriteLocalRefresh,
+	stripLocalCookieDomain,
 	validateBaseDomain,
 	validateClientIpHeader,
 	validateRemoteDomainSettings,
@@ -269,6 +272,53 @@ describe('remote Origin/Referer rewrite', () => {
 			originRewriteDisabledApps: ['agent-zero'],
 		})!
 		expect(remoteOriginRewrite(optedOut, 'agent-zero', 'agent-zero-umbrel.example.com', lan)?.lanOrigin).toBeUndefined()
+	})
+})
+
+describe('local redirect rewrite', () => {
+	const local = {lanOrigin: 'http://umbrel.local:7455', targetHost: 'lobe-chat_app_1', targetPort: 3210}
+	const remoteOrigin = 'https://lobe-chat-umbrel.example.com'
+
+	test('maps the app local addresses to its remote origin', () => {
+		for (const url of [
+			'http://umbrel.local:7455/signin?callbackUrl=%2F',
+			'https://umbrel.local:7455/signin?callbackUrl=%2F',
+			'http://umbrel:7455/signin?callbackUrl=%2F',
+			'http://10.0.0.5:7455/signin?callbackUrl=%2F',
+			'http://[::1]:7455/signin?callbackUrl=%2F',
+			'http://lobe-chat_app_1:3210/signin?callbackUrl=%2F',
+			'http://0.0.0.0:3210/signin?callbackUrl=%2F',
+		]) {
+			expect(rewriteLocalAppUrl(url, local, remoteOrigin)).toBe(`${remoteOrigin}/signin?callbackUrl=%2F`)
+		}
+	})
+
+	test('leaves other apps, public hosts, credentials and relative URLs alone', () => {
+		for (const url of [
+			'http://umbrel.local:7458/bucket',
+			'http://lobe-chat_app_1:7455/x',
+			'http://8.8.8.8:7455/x',
+			'https://evil.com/x',
+			'http://user:pass@umbrel.local:7455/x',
+			'/signin',
+			'javascript:alert(1)',
+			'http://[bad',
+		]) {
+			expect(rewriteLocalAppUrl(url, local, remoteOrigin)).toBe(url)
+		}
+	})
+
+	test('rewrites the Refresh url and keeps its delay and quotes', () => {
+		expect(rewriteLocalRefresh("5; URL='http://umbrel.local:7455/a?b=1'", local, remoteOrigin)).toBe(
+			`5; URL='${remoteOrigin}/a?b=1'`,
+		)
+		expect(rewriteLocalRefresh('5', local, remoteOrigin)).toBe('5')
+	})
+
+	test('drops only local cookie domains', () => {
+		expect(stripLocalCookieDomain('s=1; Domain=.umbrel.local; Secure', local)).toBe('s=1; Secure')
+		expect(stripLocalCookieDomain('s=1; domain=192.168.1.10', local)).toBe('s=1')
+		expect(stripLocalCookieDomain('s=1; Domain=example.com', local)).toBe('s=1; Domain=example.com')
 	})
 })
 

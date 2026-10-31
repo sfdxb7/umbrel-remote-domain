@@ -15,8 +15,8 @@ export type RemoteDomainSettings = {
 	// App ids whose Umbrel login is turned off, but which the owner explicitly
 	// allows on the remote domain anyway.
 	allowUnauthenticatedApps?: string[]
-	// App ids that should receive the browser's original Origin and Referer
-	// headers instead of the LAN-equivalent ones (see rewriteRemoteOriginHeaders).
+	// App ids that should receive the browser's original Host, Origin and
+	// Referer headers instead of the LAN-equivalent ones (see remoteOriginRewrite).
 	originRewriteDisabledApps?: string[]
 	// App ids whose manifest-declared public paths (PROXY_AUTH_WHITELIST) stay
 	// public on the remote domain. Off for every app by default.
@@ -260,10 +260,14 @@ export function isUnderBaseDomain(remote: RemoteDomain, hostname: string) {
 }
 
 // Many apps check the browser Origin against the LAN addresses Umbrel hands
-// them (for example http://umbrel.local:3015) and reject the remote host. For a
-// request that arrived on an app's own remote host, return the remote origin
-// and the LAN origin it should be presented as. Returns undefined for every
-// other host, so LAN, IP, Tor and Tailscale requests are never touched.
+// them (for example http://umbrel.local:3015) and reject the remote host.
+// Others require the Origin host to equal Host or X-Forwarded-Host. For a
+// request that arrived on an app's own remote host, the gateway presents it the
+// way a LAN browser would send it: Host becomes the LAN host and a same-app
+// Origin/Referer the LAN origin, together, so both kinds of check pass.
+// X-Forwarded-Host and X-Forwarded-Proto keep the public host and https for
+// apps that build URLs from them. Returns undefined for every other host, so
+// LAN, IP, Tor and Tailscale requests are never touched.
 export function remoteOriginRewrite(
 	remote: RemoteDomain | undefined,
 	appId: string,
@@ -310,6 +314,96 @@ export function rewriteRemoteOriginHeaders(
 		result.referer = `${lanOrigin}${url.pathname}${url.search}`
 	}
 	return result
+}
+
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '0.0.0.0', '[::1]', '[::]'])
+
+function isPrivateOrLoopbackIp(hostname: string) {
+	const host = hostname.replace(/^\[|\]$/g, '')
+	if (net.isIPv4(host)) {
+		const [a, b] = host.split('.').map(Number) as [number, number]
+		return (
+			a === 10 || a === 127 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254)
+		)
+	}
+	if (net.isIPv6(host)) return host === '::1' || /^f[cd]/i.test(host) || /^fe[89ab]/i.test(host)
+	return false
+}
+
+export type LocalAppAddress = {
+	// The origin a LAN browser uses for the app, e.g. http://umbrel.local:3015.
+	lanOrigin?: string
+	// Where the gateway reaches the app, e.g. agent-zero_web_1:80.
+	targetHost: string
+	targetAddress?: string
+	targetPort: number
+}
+
+function lanNames(local: LocalAppAddress) {
+	if (!local.lanOrigin) return new Set<string>()
+	const hostname = new URL(local.lanOrigin).hostname.toLowerCase()
+	return new Set([hostname, hostname.replace(/\.local$/, '')])
+}
+
+function targetNames(local: LocalAppAddress) {
+	const names = new Set([local.targetHost.toLowerCase(), ...LOOPBACK_HOSTS])
+	if (local.targetAddress) names.add(hostWithBrackets(local.targetAddress.toLowerCase()))
+	return names
+}
+
+function hostWithBrackets(host: string) {
+	return net.isIPv6(host) ? `[${host}]` : host
+}
+
+// Whether a URL points at the app itself through one of its local addresses:
+// the LAN hostname (with or without .local), a private or loopback IP or
+// localhost on the app's LAN port, or the container host, its address,
+// loopback or the wildcard address on its internal port. The LAN hostname on
+// any other port is another app and does not match.
+export function isLocalAppUrl(url: URL, local: LocalAppAddress) {
+	if (url.protocol !== 'http:' && url.protocol !== 'https:') return false
+	if (url.username || url.password) return false
+	const host = url.hostname.toLowerCase()
+	const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80))
+	const lanPort = local.lanOrigin ? Number(new URL(local.lanOrigin).port || 80) : undefined
+	if (port === lanPort && (lanNames(local).has(host) || LOOPBACK_HOSTS.has(host) || isPrivateOrLoopbackIp(host))) {
+		return true
+	}
+	return port === local.targetPort && targetNames(local).has(host)
+}
+
+// Rewrite a response URL (Location, Refresh) that points at the app's local
+// address to the same path on its remote origin. Relative and foreign URLs
+// are returned unchanged.
+export function rewriteLocalAppUrl(value: string, local: LocalAppAddress, remoteOrigin: string) {
+	if (!/^(?:https?:)?\/\//i.test(value.trim())) return value
+	let url: URL
+	try {
+		url = new URL(value.trim(), 'http://placeholder.invalid')
+	} catch {
+		return value
+	}
+	if (!isLocalAppUrl(url, local)) return value
+	return `${remoteOrigin}${url.pathname}${url.search}${url.hash}`
+}
+
+// Refresh: 0; url=http://umbrel.local:7455/signin
+export function rewriteLocalRefresh(value: string, local: LocalAppAddress, remoteOrigin: string) {
+	const match = /^(\s*[\d.]*\s*[;,]\s*url\s*=\s*)(['"]?)(.*?)\2(\s*)$/i.exec(value)
+	if (!match) return value
+	const [, prefix, quote, url, suffix] = match
+	return `${prefix}${quote}${rewriteLocalAppUrl(url!, local, remoteOrigin)}${quote}${suffix}`
+}
+
+// Drop a Set-Cookie Domain attribute that names a local hostname, so the
+// cookie becomes host-only on the remote host instead of being rejected by
+// the browser.
+export function stripLocalCookieDomain(cookie: string, local: LocalAppAddress) {
+	return cookie.replace(/;\s*domain\s*=\s*([^;]*)/gi, (attribute, domain: string) => {
+		const host = hostWithBrackets(domain.trim().toLowerCase().replace(/^\./, ''))
+		const isLocal = lanNames(local).has(host) || targetNames(local).has(host) || isPrivateOrLoopbackIp(host)
+		return isLocal ? '' : attribute
+	})
 }
 
 // True for any request whose Host is the base domain or below it. Such
