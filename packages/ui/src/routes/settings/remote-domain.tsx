@@ -164,6 +164,7 @@ export function RemoteDomainSettingsPanel({onBack}: {onBack: () => void}) {
 						<summary className='cursor-pointer text-14 font-medium'>{t('remote-domain.advanced')}</summary>
 						<div className='mt-3 flex flex-col gap-y-3'>
 							<p className='text-12 leading-tight text-white/45'>{t('remote-domain.advanced-description')}</p>
+							<p className='text-12 leading-tight text-white/45'>{t('remote-domain.advanced-login-note')}</p>
 							<Labeled label={t('remote-domain.dashboard-subdomain')}>
 								<Input
 									sizeVariant='short-square'

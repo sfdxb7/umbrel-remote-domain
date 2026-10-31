@@ -236,6 +236,7 @@ The settings page warns the owner when 2FA is off. Turning on 2FA for every acco
 ## Known limits
 
 - Apps without an app gateway, and non-HTTP ports, are not routed on the remote domain.
+- If an app doesn't work on the remote domain, turn on Umbrel's login in that app's settings. Apps with the login off are blocked remotely unless you allow them in the settings panel.
 - Home-screen shortcuts, widgets and the MCP `get_app_details` URL still use port URLs.
 - `X-Forwarded-For` is only used to find the client address for login throttling. The secure context comes from the proxy → :443 hop being HTTPS, not from `X-Forwarded-Proto`.
 - Login throttling state is kept in memory, so it resets when umbreld restarts.
