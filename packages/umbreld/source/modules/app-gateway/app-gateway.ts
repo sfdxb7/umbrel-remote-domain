@@ -21,8 +21,10 @@ import {appGatewayErrorPage} from './error-page.js'
 import safeRedirectPath from '../utilities/safe-redirect-path.js'
 import {
 	appRemoteHost,
+	isRemoteDomainRequest,
 	normaliseHostHeader,
 	remoteAppAuthUrl,
+	remotePublicPathsAllowed,
 	remoteOriginRewrite,
 	rewriteRemoteOriginHeaders,
 	type RemoteDomain,
@@ -324,10 +326,19 @@ export default class AppGateway {
 		if (headers.referer) proxyRequest.setHeader('referer', headers.referer)
 	}
 
+	// Manifest-declared public paths (PROXY_AUTH_WHITELIST) were designed for the
+	// LAN. On the remote domain they would be public on the internet, so they
+	// only apply there when the owner allowed it for this app.
+	private publicPathsApply(request: express.Request | http.IncomingMessage) {
+		const remote = this.#getRemoteDomain?.()
+		if (!isRemoteDomainRequest(remote, browserHost(request))) return true
+		return remotePublicPathsAllowed(remote!, this.#config.appId)
+	}
+
 	private async isAuthorized(request: express.Request | http.IncomingMessage) {
 		if (!this.#config.auth) return
 		const pathname = new URL(request.url ?? '/', 'http://umbrel.local').pathname
-		const whitelisted = pathMatches(pathname, this.#config.authWhitelist)
+		const whitelisted = this.publicPathsApply(request) && pathMatches(pathname, this.#config.authWhitelist)
 		const blacklisted = pathMatches(pathname, this.#config.authBlacklist)
 		if (whitelisted && !blacklisted) return
 

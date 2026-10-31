@@ -272,3 +272,90 @@ describe('app gateway remote Origin/Referer rewrite', () => {
 		expect(upstream.seen[1]).toMatchObject({origin: `https://${remoteHost}`, 'x-forwarded-host': remoteHost})
 	})
 })
+
+describe('app gateway public paths on the remote domain', () => {
+	const closers: Array<() => Promise<void>> = []
+	afterEach(async () => {
+		await Promise.all(closers.splice(0).map((close) => close()))
+	})
+
+	async function listen(server: http.Server) {
+		await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+		closers.push(() => new Promise<void>((resolve) => server.close(() => resolve())))
+		return (server.address() as net.AddressInfo).port
+	}
+
+	async function startGateway(remoteDomain: RemoteDomain | undefined) {
+		const upstreamPort = await listen(http.createServer((_request, response) => response.end('upstream')))
+		const umbreld = {
+			logger: {error: vi.fn()},
+			dataDirectory: '/does-not-exist',
+			auth: {
+				appAccessRevision: 0,
+				authenticate: vi.fn(async () => {
+					throw new Error('unauthenticated')
+				}),
+				authorizeApp: vi.fn(),
+			},
+		}
+		const gateway = new AppGateway(
+			umbreld as never,
+			{
+				appId: 'vaultwarden',
+				appName: 'Vaultwarden',
+				appIcon: 'https://example.com/icon.svg',
+				targetProtocol: 'http',
+				targetHost: 'vaultwarden_server_1',
+				targetAddress: '127.0.0.1',
+				targetPort: upstreamPort,
+				auth: true,
+				authWhitelist: ['/api/*', '/identity/*'],
+				authBlacklist: ['/api/admin'],
+				trustUpstream: false,
+				timeout: 1_000,
+			},
+			{getRemoteDomain: () => remoteDomain},
+		)
+		const port = await listen(gateway.server)
+		return `http://127.0.0.1:${port}`
+	}
+
+	const get = (origin: string, path: string, host: string) =>
+		fetch(`${origin}${path}`, {
+			redirect: 'manual',
+			headers: {'x-forwarded-host': host, 'x-forwarded-proto': 'https'},
+		})
+
+	test('ignores PROXY_AUTH_WHITELIST on the remote host by default', async () => {
+		const origin = await startGateway(remote)
+		const response = await get(origin, '/api/sync', 'vaultwarden-umbrel.example.com')
+		expect(response.status).toBe(302)
+		expect(new URL(response.headers.get('location')!).origin).toBe('https://umbrel-auth.example.com')
+	})
+
+	test('honours it remotely once the owner allows the app', async () => {
+		const allowed = resolveRemoteDomain({
+			enabled: true,
+			baseDomain: 'example.com',
+			allowPublicPathApps: ['vaultwarden'],
+		})!
+		const origin = await startGateway(allowed)
+		const response = await get(origin, '/identity/connect/token', 'vaultwarden-umbrel.example.com')
+		expect(response.status).toBe(200)
+		expect(await response.text()).toBe('upstream')
+		// The blacklist and non-public paths still need Umbrel login
+		expect((await get(origin, '/api/admin', 'vaultwarden-umbrel.example.com')).status).toBe(302)
+		expect((await get(origin, '/vault', 'vaultwarden-umbrel.example.com')).status).toBe(302)
+	})
+
+	test('keeps upstream behaviour on the LAN and when the mode is off', async () => {
+		for (const remoteDomain of [remote, undefined]) {
+			const origin = await startGateway(remoteDomain)
+			const lan = await get(origin, '/api/sync', '192.168.1.10:8080')
+			expect(lan.status).toBe(200)
+			expect(await lan.text()).toBe('upstream')
+		}
+		const off = await startGateway(undefined)
+		expect((await get(off, '/api/sync', 'vaultwarden-umbrel.example.com')).status).toBe(200)
+	})
+})

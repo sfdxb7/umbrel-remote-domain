@@ -19,13 +19,59 @@ import type {Context} from '../server/trpc/context.js'
 import {privateProcedure, privateProcedureWithMembers, publicProcedure, router} from '../server/trpc/trpc.js'
 import {accountAvatarUrl, serializeAccountAvatar} from './avatar-api.js'
 import {OWNER_USER_ID} from './constants.js'
-import type {AccountLoginValidation} from './user.js'
+import {loginClientFromRequest, isRemoteDomainHttpRequest} from '../server/client-ip.js'
+import {rateLimitMessage} from './login-throttle.js'
+import type {AccountLoginAttempt} from './user.js'
 import {isWallpaperId, resolveWallpaperAppearance} from './wallpapers.js'
 
-const loginErrorMessage = (reason: Extract<AccountLoginValidation, {valid: false}>['reason']) => {
+const loginErrorMessage = (reason: Exclude<Extract<AccountLoginAttempt, {valid: false}>['reason'], 'rate-limited'>) => {
 	if (reason === 'missing-totp') return 'Missing 2FA code'
 	if (reason === 'incorrect-totp') return 'Incorrect 2FA code'
 	return 'Incorrect password'
+}
+
+// Shared by login and loginNative. Throws the tRPC error for a failed attempt.
+async function attemptLogin(
+	ctx: Context,
+	input: {userId: string; username?: string; password: string; totpToken?: string},
+) {
+	const result = await ctx.user.attemptAccountLogin({
+		userId: input.userId,
+		username: input.username,
+		password: input.password,
+		totpToken: input.totpToken,
+		client: loginClientFromRequest(ctx.umbreld, ctx.request!),
+	})
+	if (result.valid) return result
+	if (result.reason === 'rate-limited') {
+		ctx.response!.set('Retry-After', String(result.retryAfterSeconds))
+		throw new TRPCError({code: 'TOO_MANY_REQUESTS', message: rateLimitMessage(result.retryAfterSeconds)})
+	}
+	throw new TRPCError({code: 'UNAUTHORIZED', message: loginErrorMessage(result.reason)})
+}
+
+// Whether the request is on the public remote domain. WebSocket calls are
+// always authenticated, so only HTTP requests need the stricter answers.
+function isRemoteRequest(ctx: Context) {
+	return ctx.transport === 'express' && !!ctx.request && isRemoteDomainHttpRequest(ctx.umbreld, ctx.request)
+}
+
+// Whether the caller presented valid credentials. Unlike
+// resolveOptionalAccountId this never falls back to the owner.
+async function hasValidCredentials(ctx: Context) {
+	try {
+		if (ctx.transport === 'ws') {
+			if (!ctx.principal) return false
+			await ctx.umbreld.auth.validatePrincipal(ctx.principal)
+			return true
+		}
+		const [scheme, token] = ctx.request?.headers.authorization?.split(' ') ?? []
+		if (scheme?.toLowerCase() !== 'bearer' || !token || !ctx.request) return false
+		await ctx.umbreld.auth.authenticateApiCredentials(token, browserSessionTokenFromRequest(ctx.request))
+		return true
+	} catch {
+		return false
+	}
 }
 
 // Public cosmetic endpoints are used both before login and from authenticated
@@ -67,6 +113,11 @@ export default router({
 			}),
 		)
 		.mutation(async ({ctx, input}) => {
+			// Onboarding only happens on the LAN. The remote domain is configured by
+			// an existing owner, so a register call there is never legitimate.
+			if (isRemoteRequest(ctx)) {
+				throw new TRPCError({code: 'FORBIDDEN', message: 'Registration is not available on the remote domain'})
+			}
 			if (await ctx.user.exists()) {
 				throw new TRPCError({code: 'UNAUTHORIZED', message: 'Attempted to register when user is already registered'})
 			}
@@ -89,10 +140,15 @@ export default router({
 			return ctx.user.register(input.name, input.password, input.language)
 		}),
 
-	exists: publicProcedure.query(async ({ctx}) => ctx.user.exists()),
+	// The remote domain only works once an owner exists, so it always says yes
+	// there rather than reveal setup state to the internet.
+	exists: publicProcedure.query(async ({ctx}) => (isRemoteRequest(ctx) ? true : ctx.user.exists())),
 
 	// Public so the login and app-auth account pickers can render before auth.
+	// On the remote domain the list is only given to signed-in callers; the
+	// login screen then asks for a username instead.
 	listAccounts: publicProcedure.query(async ({ctx}) => {
+		if (isRemoteRequest(ctx) && !(await hasValidCredentials(ctx))) return []
 		if (!(await ctx.user.exists())) return []
 		return (await ctx.user.listAccounts()).map((account) => ({
 			...serializeAccountAvatar(account),
@@ -104,6 +160,9 @@ export default router({
 		.input(
 			z.object({
 				userId: z.string().default(OWNER_USER_ID),
+				// Typed account name, used where the account list is hidden. Takes
+				// precedence over userId when present.
+				username: z.string().max(256).optional(),
 				password: z.string(),
 				totpToken: z.string().optional(),
 			}),
@@ -112,14 +171,11 @@ export default router({
 			if (!ctx.request || !ctx.response) {
 				throw new TRPCError({code: 'METHOD_NOT_SUPPORTED', message: 'HTTP transport required'})
 			}
-			const validation = await ctx.user.validateAccountLogin(input.userId, input.password, input.totpToken)
-			if (!validation.valid) {
-				throw new TRPCError({code: 'UNAUTHORIZED', message: loginErrorMessage(validation.reason)})
-			}
+			const validation = await attemptLogin(ctx, input)
 
 			const session = await ctx.umbreld.auth
 				.createSession({
-					accountId: input.userId,
+					accountId: validation.userId,
 					userAgent: ctx.request!.get('user-agent'),
 					expectedSessionIssuanceRevision: validation.sessionIssuanceRevision,
 				})
@@ -138,6 +194,9 @@ export default router({
 		.input(
 			z.object({
 				userId: z.string().default(OWNER_USER_ID),
+				// Typed account name, used where the account list is hidden. Takes
+				// precedence over userId when present.
+				username: z.string().max(256).optional(),
 				password: z.string(),
 				totpToken: z.string().optional(),
 				client: nativeClientSchema,
@@ -147,14 +206,11 @@ export default router({
 			if (!ctx.request || !ctx.response) {
 				throw new TRPCError({code: 'METHOD_NOT_SUPPORTED', message: 'HTTP transport required'})
 			}
-			const validation = await ctx.user.validateAccountLogin(input.userId, input.password, input.totpToken)
-			if (!validation.valid) {
-				throw new TRPCError({code: 'UNAUTHORIZED', message: loginErrorMessage(validation.reason)})
-			}
+			const validation = await attemptLogin(ctx, input)
 
 			const session = await ctx.umbreld.auth
 				.createNativeSession({
-					accountId: input.userId,
+					accountId: validation.userId,
 					nativeClient: input.client,
 					userAgent: ctx.request!.get('user-agent'),
 					expectedSessionIssuanceRevision: validation.sessionIssuanceRevision,
@@ -375,9 +431,11 @@ export default router({
 			return ctx.user.enable2faForAccount(accountId, input.totpUri)
 		}),
 
-	is2faEnabled: publicProcedure.query(async ({ctx}) =>
-		ctx.user.is2faEnabledForAccount(await resolveOptionalAccountId(ctx)),
-	),
+	is2faEnabled: publicProcedure.query(async ({ctx}) => {
+		// Unauthenticated remote callers learn nothing about the owner's 2FA
+		if (isRemoteRequest(ctx) && !(await hasValidCredentials(ctx))) return false
+		return ctx.user.is2faEnabledForAccount(await resolveOptionalAccountId(ctx))
+	}),
 
 	disable2fa: privateProcedureWithMembers.input(z.object({totpToken: z.string()})).mutation(async ({ctx, input}) => {
 		const accountId = ctx.principal!.accountId

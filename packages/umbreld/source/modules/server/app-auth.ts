@@ -12,7 +12,9 @@ import {serializeAccountAvatar, serveAccountAvatar} from '../user/avatar-api.js'
 import {OWNER_USER_ID} from '../user/constants.js'
 import {resolveWallpaperAppearance} from '../user/wallpapers.js'
 import safeRedirectPath from '../utilities/safe-redirect-path.js'
-import {isRemoteAuthRequest} from '../lan-ingress/remote-domain.js'
+import {isRemoteAuthRequest, isRemoteDomainRequest} from '../lan-ingress/remote-domain.js'
+import {rateLimitMessage} from '../user/login-throttle.js'
+import {loginClientFromRequest} from './client-ip.js'
 
 type AppAuthRequest = {
 	appId: string
@@ -84,6 +86,10 @@ export async function appHandoffFormAction(umbreld: Umbreld, request: express.Re
 		} catch {}
 	}
 
+	// On the remote domain every app has its own exact origin (handled above).
+	// Never fall back to a wildcard port there: keep helmet's 'self'.
+	if (isRemoteDomainRequest(umbreld.lanIngress.remoteDomain, request.hostname)) return
+
 	return formActionSource(request.protocol, request.hostname, '*')
 }
 
@@ -140,6 +146,16 @@ export function rewriteAppAuthDevProxyPath(path: string) {
 
 export default function createAppAuthRouter(umbreld: Umbreld) {
 	const router = express.Router()
+	// On the remote domain app login lives only on the auth host. The same
+	// router is reachable under /app-auth on every host, so refuse it on the
+	// dashboard host and anything else under the base domain.
+	router.use((request, response, next) => {
+		const remote = umbreld.lanIngress.remoteDomain
+		if (isRemoteDomainRequest(remote, request.hostname) && !isRemoteAuthRequest(remote, request.hostname)) {
+			return response.status(404).set('Cache-Control', 'no-store').json({error: 'Not found'})
+		}
+		next()
+	})
 	// App login finishes with a form POST from the dedicated auth port back to
 	// the app port. Helmet's default `form-action 'self'` blocks that because
 	// ports are part of an origin. Allow the current LAN hostname on another port,
@@ -159,7 +175,10 @@ export default function createAppAuthRouter(umbreld: Umbreld) {
 		next()
 	})
 
-	router.get('/v1/account/accounts', async (_request, response) => {
+	router.get('/v1/account/accounts', async (request, response) => {
+		// Never list accounts to the internet; the remote login form asks for a
+		// username instead.
+		if (isRemoteDomainRequest(umbreld.lanIngress.remoteDomain, request.hostname)) return response.json([])
 		if (!(await umbreld.user.exists())) return response.json([])
 		response.json(
 			(await umbreld.user.listAccounts()).map((account) => ({
@@ -171,9 +190,20 @@ export default function createAppAuthRouter(umbreld: Umbreld) {
 
 	router.post('/v1/account/login', async (request, response) => {
 		const userId = typeof request.body?.userId === 'string' ? request.body.userId : OWNER_USER_ID
+		const username = typeof request.body?.username === 'string' ? request.body.username.slice(0, 256) : undefined
 		const password = typeof request.body?.password === 'string' ? request.body.password : ''
 		const totpToken = typeof request.body?.totpToken === 'string' ? request.body.totpToken : undefined
-		const validation = await umbreld.user.validateAccountLogin(userId, password, totpToken)
+		const validation = await umbreld.user.attemptAccountLogin({
+			userId,
+			username,
+			password,
+			totpToken,
+			client: loginClientFromRequest(umbreld, request),
+		})
+		if (!validation.valid && validation.reason === 'rate-limited') {
+			response.set('Retry-After', String(validation.retryAfterSeconds))
+			return response.status(429).json({error: {code: -32029, message: rateLimitMessage(validation.retryAfterSeconds)}})
+		}
 		if (!validation.valid) {
 			const message =
 				validation.reason === 'missing-totp'
@@ -187,7 +217,7 @@ export default function createAppAuthRouter(umbreld: Umbreld) {
 		let session
 		try {
 			session = await umbreld.auth.createSession({
-				accountId: userId,
+				accountId: validation.userId,
 				userAgent: request.get('user-agent'),
 				expectedSessionIssuanceRevision: validation.sessionIssuanceRevision,
 			})
@@ -231,6 +261,18 @@ export default function createAppAuthRouter(umbreld: Umbreld) {
 	router.get('/v1/apps', async (request, response) => {
 		const appId = requestString(request, 'app')
 		if (!/^[a-zA-Z0-9-]+$/.test(appId)) return response.status(400).json({error: 'Invalid app'})
+		// On the remote domain answer the same for apps that are not installed,
+		// fail to load, or are not routed remotely, so the endpoint cannot be used
+		// to list what is installed.
+		if (isRemoteDomainRequest(umbreld.lanIngress.remoteDomain, request.hostname)) {
+			try {
+				if (!umbreld.lanIngress.remoteAppOrigin(appId)) throw new Error('Not routed')
+				const manifest = await umbreld.apps.getApp(appId).readManifest()
+				return response.json({id: manifest.id, name: manifest.name})
+			} catch {
+				return response.status(404).json({error: 'Not found'})
+			}
+		}
 		const manifest = await umbreld.apps.getApp(appId).readManifest()
 		response.json({id: manifest.id, name: manifest.name})
 	})

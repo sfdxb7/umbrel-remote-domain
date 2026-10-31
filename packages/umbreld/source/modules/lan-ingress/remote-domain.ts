@@ -18,6 +18,16 @@ export type RemoteDomainSettings = {
 	// App ids that should receive the browser's original Origin and Referer
 	// headers instead of the LAN-equivalent ones (see rewriteRemoteOriginHeaders).
 	originRewriteDisabledApps?: string[]
+	// App ids whose manifest-declared public paths (PROXY_AUTH_WHITELIST) stay
+	// public on the remote domain. Off for every app by default.
+	allowPublicPathApps?: string[]
+	// Reverse proxies whose X-Forwarded-For (or clientIpHeader) umbreld trusts
+	// for remote-domain requests, as IPs or CIDRs. Unset means loopback and
+	// private networks, where a proxy on the same machine or network sits.
+	trustedProxies?: string[]
+	// Optional header a trusted proxy sets to the client IP, for example
+	// X-Real-IP. Unset means the X-Forwarded-For chain is used.
+	clientIpHeader?: string
 }
 
 export type RemoteDomain = {
@@ -28,12 +38,23 @@ export type RemoteDomain = {
 	appSubdomainTemplate: string
 	allowUnauthenticatedApps: string[]
 	originRewriteDisabledApps: string[]
+	allowPublicPathApps: string[]
+	trustedProxies: string[]
+	clientIpHeader?: string
 }
 
 export const DEFAULT_DASHBOARD_SUBDOMAIN = 'umbrel'
 export const DEFAULT_AUTH_SUBDOMAIN = 'umbrel-auth'
 export const DEFAULT_APP_SUBDOMAIN_TEMPLATE = '{app}-umbrel'
 export const APP_PLACEHOLDER = '{app}'
+export const DEFAULT_TRUSTED_PROXIES = [
+	'127.0.0.0/8',
+	'::1/128',
+	'10.0.0.0/8',
+	'172.16.0.0/12',
+	'192.168.0.0/16',
+	'fc00::/7',
+]
 
 const LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/
 const MAX_DOMAIN_LENGTH = 253
@@ -72,12 +93,33 @@ export function validateAppSubdomainTemplate(value: string) {
 		return 'Enter a valid app subdomain pattern such as {app}-umbrel'
 }
 
+// An IP address or CIDR range such as 172.18.0.0/16.
+export function validateTrustedProxy(value: string) {
+	const [address, prefix, ...rest] = value.split('/')
+	const family = net.isIP(address ?? '')
+	if (!family || rest.length) return `Invalid trusted proxy ${value}`
+	if (prefix === undefined) return
+	const bits = Number(prefix)
+	if (!/^\d+$/.test(prefix) || bits > (family === 4 ? 32 : 128)) return `Invalid trusted proxy ${value}`
+}
+
+export function validateClientIpHeader(value: string) {
+	if (!/^[a-zA-Z0-9-]{1,64}$/.test(value)) return 'Enter a header name such as X-Real-IP'
+	const name = value.toLowerCase()
+	// Headers umbreld or the browser control; using them would be meaningless or spoofable.
+	if (['host', 'cookie', 'authorization', 'x-forwarded-host', 'x-forwarded-proto'].includes(name)) {
+		return `${value} cannot carry the client IP`
+	}
+}
+
 export function validateRemoteDomainSettings(settings: RemoteDomainSettings) {
 	const errors = [
 		validateBaseDomain(settings.baseDomain),
 		validateSubdomain(settings.dashboardSubdomain ?? DEFAULT_DASHBOARD_SUBDOMAIN),
 		validateSubdomain(settings.authSubdomain ?? DEFAULT_AUTH_SUBDOMAIN),
 		validateAppSubdomainTemplate(settings.appSubdomainTemplate ?? DEFAULT_APP_SUBDOMAIN_TEMPLATE),
+		...(settings.trustedProxies ?? []).map(validateTrustedProxy),
+		settings.clientIpHeader ? validateClientIpHeader(settings.clientIpHeader) : undefined,
 	].filter(Boolean)
 	if (errors.length) return errors[0]
 	const dashboardHost = `${settings.dashboardSubdomain ?? DEFAULT_DASHBOARD_SUBDOMAIN}.${settings.baseDomain}`
@@ -115,6 +157,13 @@ export function resolveRemoteDomain(settings: RemoteDomainSettings | undefined):
 		appSubdomainTemplate,
 		allowUnauthenticatedApps: [...new Set(settings.allowUnauthenticatedApps ?? [])],
 		originRewriteDisabledApps: [...new Set(settings.originRewriteDisabledApps ?? [])],
+		allowPublicPathApps: [...new Set(settings.allowPublicPathApps ?? [])],
+		trustedProxies: settings.trustedProxies?.length
+			? settings.trustedProxies.filter((entry) => !validateTrustedProxy(entry))
+			: DEFAULT_TRUSTED_PROXIES,
+		...(settings.clientIpHeader && !validateClientIpHeader(settings.clientIpHeader)
+			? {clientIpHeader: settings.clientIpHeader.toLowerCase()}
+			: {}),
 	}
 }
 
@@ -261,4 +310,18 @@ export function rewriteRemoteOriginHeaders(
 		result.referer = `${lanOrigin}${url.pathname}${url.search}`
 	}
 	return result
+}
+
+// True for any request whose Host is the base domain or below it. Such
+// requests came through the public reverse proxy (or look like they did), so
+// they get the stricter remote behaviour. LAN, IP, mDNS, Tor and Tailscale
+// hosts never match.
+export function isRemoteDomainRequest(remote: RemoteDomain | undefined, hostname: string | undefined) {
+	return !!remote && !!hostname && isUnderBaseDomain(remote, hostname)
+}
+
+// Whether an app's manifest-declared public paths stay public on its remote
+// host. Off unless the owner allowed it for this app.
+export function remotePublicPathsAllowed(remote: RemoteDomain, appId: string) {
+	return remote.allowPublicPathApps.includes(appId)
 }

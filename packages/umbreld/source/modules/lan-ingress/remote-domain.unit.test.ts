@@ -1,18 +1,23 @@
 import {describe, expect, test} from 'vitest'
 
 import {
+	DEFAULT_TRUSTED_PROXIES,
 	appRemoteHost,
 	buildAppHostMap,
 	isRemoteAuthRequest,
+	isRemoteDomainRequest,
 	lanAppOrigin,
 	matchRemoteHost,
 	normaliseHostHeader,
+	remotePublicPathsAllowed,
 	remoteAppAuthUrl,
 	remoteOriginRewrite,
 	resolveRemoteDomain,
 	rewriteRemoteOriginHeaders,
 	validateBaseDomain,
+	validateClientIpHeader,
 	validateRemoteDomainSettings,
+	validateTrustedProxy,
 } from './remote-domain.js'
 import {remoteDispatch} from './lan-ingress.js'
 
@@ -33,6 +38,9 @@ describe('remote domain settings', () => {
 			appSubdomainTemplate: '{app}-umbrel',
 			allowUnauthenticatedApps: [],
 			originRewriteDisabledApps: [],
+			allowPublicPathApps: [],
+			trustedProxies: DEFAULT_TRUSTED_PROXIES,
+			clientIpHeader: undefined,
 		})
 		expect(appRemoteHost(remote, 'nextcloud')).toBe('nextcloud-umbrel.example.com')
 	})
@@ -261,5 +269,75 @@ describe('remote Origin/Referer rewrite', () => {
 			originRewriteDisabledApps: ['agent-zero'],
 		})!
 		expect(remoteOriginRewrite(optedOut, 'agent-zero', 'agent-zero-umbrel.example.com', lan)?.lanOrigin).toBeUndefined()
+	})
+})
+
+describe('remote hardening settings', () => {
+	test('validates trusted proxies', () => {
+		for (const ok of ['172.18.0.2', '172.16.0.0/12', '::1', 'fc00::/7', '2001:db8::/128', '0.0.0.0/0']) {
+			expect(validateTrustedProxy(ok)).toBeUndefined()
+		}
+		for (const bad of ['', 'proxy', '172.18.0.0/33', '::/129', '10.0.0.0/8/1', '10.0.0.0/x', '10.0.0.0/']) {
+			expect(validateTrustedProxy(bad)).toBeTruthy()
+		}
+	})
+
+	test('validates the client IP header', () => {
+		expect(validateClientIpHeader('X-Real-IP')).toBeUndefined()
+		expect(validateClientIpHeader('CF-Connecting-IP')).toBeUndefined()
+		for (const bad of [
+			'',
+			'X Real',
+			'a:b',
+			'Host',
+			'cookie',
+			'Authorization',
+			'X-Forwarded-Host',
+			'x-forwarded-proto',
+		]) {
+			expect(validateClientIpHeader(bad)).toBeTruthy()
+		}
+		expect(validateClientIpHeader('x'.repeat(65))).toBeTruthy()
+	})
+
+	test('rejects invalid hardening settings and resolves valid ones', () => {
+		const base = {enabled: true, baseDomain: 'example.com'}
+		expect(validateRemoteDomainSettings({...base, trustedProxies: ['10.0.0.0/8', 'nope']})).toBe(
+			'Invalid trusted proxy nope',
+		)
+		expect(validateRemoteDomainSettings({...base, clientIpHeader: 'Host'})).toBe('Host cannot carry the client IP')
+		const resolved = resolveRemoteDomain({
+			...base,
+			trustedProxies: ['198.51.100.7'],
+			clientIpHeader: 'X-Real-IP',
+			allowPublicPathApps: ['vaultwarden', 'vaultwarden'],
+		})!
+		expect(resolved.trustedProxies).toEqual(['198.51.100.7'])
+		expect(resolved.clientIpHeader).toBe('x-real-ip')
+		expect(resolved.allowPublicPathApps).toEqual(['vaultwarden'])
+		expect(resolveRemoteDomain({...base, trustedProxies: []})!.trustedProxies).toEqual(DEFAULT_TRUSTED_PROXIES)
+		expect(resolveRemoteDomain({...base, clientIpHeader: 'Host'})!.clientIpHeader).toBeUndefined()
+	})
+
+	test('public paths stay off remotely unless allowed per app', () => {
+		expect(remotePublicPathsAllowed(remote, 'vaultwarden')).toBe(false)
+		const allowed = resolveRemoteDomain({
+			enabled: true,
+			baseDomain: 'example.com',
+			allowPublicPathApps: ['vaultwarden'],
+		})!
+		expect(remotePublicPathsAllowed(allowed, 'vaultwarden')).toBe(true)
+		expect(remotePublicPathsAllowed(allowed, 'nextcloud')).toBe(false)
+	})
+
+	test('isRemoteDomainRequest() matches only the base domain and below', () => {
+		expect(isRemoteDomainRequest(remote, 'umbrel.example.com')).toBe(true)
+		expect(isRemoteDomainRequest(remote, 'anything.example.com')).toBe(true)
+		expect(isRemoteDomainRequest(remote, 'example.com')).toBe(true)
+		for (const host of ['192.168.1.10', 'umbrel.local', 'abc.onion', 'example.com.evil.com', 'notexample.com']) {
+			expect(isRemoteDomainRequest(remote, host)).toBe(false)
+		}
+		expect(isRemoteDomainRequest(undefined, 'umbrel.example.com')).toBe(false)
+		expect(isRemoteDomainRequest(remote, undefined)).toBe(false)
 	})
 })

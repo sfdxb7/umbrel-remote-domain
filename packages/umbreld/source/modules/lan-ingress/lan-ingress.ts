@@ -25,6 +25,7 @@ import {
 	lanAppOrigin,
 	matchRemoteHost,
 	normaliseHostHeader,
+	remotePublicPathsAllowed,
 	resolveRemoteDomain,
 	type RemoteDomain,
 } from './remote-domain.js'
@@ -80,6 +81,10 @@ export type RemoteAppStatus = {
 	authEnabled: boolean
 	allowed: boolean
 	reachable: boolean
+	// Paths the app's manifest makes public (PROXY_AUTH_WHITELIST). On the
+	// remote domain they need the owner's per-app opt-in.
+	publicPaths: string[]
+	publicPathsAllowed: boolean
 }
 
 // Decide how a dashboard listener handles a Host. Pure so it can be unit tested.
@@ -1000,7 +1005,16 @@ export default class LanIngress {
 			.map(([host, appId]) => {
 				const authEnabled = this.remoteAppAuth(appId) !== false
 				const allowed = remote.allowUnauthenticatedApps.includes(appId)
-				return {appId, origin: `https://${host}`, authEnabled, allowed, reachable: authEnabled || allowed}
+				const publicPaths = authEnabled ? (this.#appMuxServers.get(appId)?.route.gateway?.authWhitelist ?? []) : []
+				return {
+					appId,
+					origin: `https://${host}`,
+					authEnabled,
+					allowed,
+					reachable: authEnabled || allowed,
+					publicPaths,
+					publicPathsAllowed: publicPaths.length > 0 && remotePublicPathsAllowed(remote, appId),
+				}
 			})
 			.sort((a, b) => a.appId.localeCompare(b.appId))
 	}

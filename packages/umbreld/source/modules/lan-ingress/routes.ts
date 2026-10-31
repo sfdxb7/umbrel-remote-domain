@@ -7,6 +7,7 @@ import {
 	DEFAULT_APP_SUBDOMAIN_TEMPLATE,
 	DEFAULT_AUTH_SUBDOMAIN,
 	DEFAULT_DASHBOARD_SUBDOMAIN,
+	DEFAULT_TRUSTED_PROXIES,
 	validateRemoteDomainSettings,
 	type RemoteDomainSettings,
 } from './remote-domain.js'
@@ -25,6 +26,12 @@ const RemoteDomainSettingsSchema = z.object({
 		.array(z.string().regex(/^[a-zA-Z0-9-]+$/))
 		.max(500)
 		.optional(),
+	allowPublicPathApps: z
+		.array(z.string().regex(/^[a-zA-Z0-9-]+$/))
+		.max(500)
+		.optional(),
+	trustedProxies: z.array(z.string().trim().max(64)).max(100).optional(),
+	clientIpHeader: z.string().trim().max(64).optional(),
 })
 
 export default router({
@@ -57,6 +64,10 @@ export default router({
 			...result,
 			allowUnauthenticatedApps: stored?.allowUnauthenticatedApps ?? [],
 			originRewriteDisabledApps: stored?.originRewriteDisabledApps ?? [],
+			allowPublicPathApps: stored?.allowPublicPathApps ?? [],
+			trustedProxies: stored?.trustedProxies ?? [],
+			defaultTrustedProxies: DEFAULT_TRUSTED_PROXIES,
+			clientIpHeader: stored?.clientIpHeader ?? '',
 			apps: lanIngress.remoteAppStatus(),
 		}
 	}),
@@ -67,6 +78,9 @@ export default router({
 			...input,
 			allowUnauthenticatedApps: [...new Set(input.allowUnauthenticatedApps ?? [])],
 			originRewriteDisabledApps: [...new Set(input.originRewriteDisabledApps ?? [])],
+			allowPublicPathApps: [...new Set(input.allowPublicPathApps ?? [])],
+			trustedProxies: [...new Set((input.trustedProxies ?? []).filter(Boolean))],
+			clientIpHeader: input.clientIpHeader || undefined,
 		}
 		if (next.enabled || next.baseDomain) {
 			const error = validateRemoteDomainSettings(next)

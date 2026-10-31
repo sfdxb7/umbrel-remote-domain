@@ -42,6 +42,30 @@ export type AuthenticatedWebSocketRequest = http.IncomingMessage & {authPrincipa
 
 export const MAX_WEBSOCKET_PAYLOAD_BYTES = 1024 * 1024
 
+// Security headers for every umbreld response. Exported for tests.
+export function securityHeaders({developmentMode}: {developmentMode?: boolean}) {
+	return [
+		helmet.contentSecurityPolicy({
+			directives: {
+				// Allow inline scripts ONLY in development for vite dev server
+				scriptSrc: developmentMode ? ["'self'", "'unsafe-inline'"] : null,
+				// Allow 3rd party app images (remove this if we serve them locally in the future)
+				// Also allow blob: URLs for images being uploaded in Files (since their thumbnails don't exist yet)
+				// and data: URLs for browser-rendered VM cursor images from noVNC.
+				imgSrc: ['*', 'blob:', 'data:'],
+				// Allow fetching data from our apps API (e.g., for Discover page in App Store)
+				connectSrc: ["'self'", 'https://apps.umbrel.com'],
+				// Allow plain text access over the local network
+				upgradeInsecureRequests: null,
+			},
+		}),
+		helmet.referrerPolicy({policy: 'no-referrer'}),
+		// Stop browsers guessing a script or stylesheet out of a response served
+		// with another type (dashboard, app-auth and file downloads alike)
+		helmet.noSniff(),
+	]
+}
+
 // Safely wrapps async request handlers in logic to catch errors and pass them to the errror handling middleware
 const asyncHandler = (
 	handler: (request: express.Request, response: express.Response, next: express.NextFunction) => Promise<any>,
@@ -117,24 +141,8 @@ class Server {
 		// Setup cookie parser
 		this.app.use(cookieParser())
 
-		// Security hardening, CSP
-		this.app.use(
-			helmet.contentSecurityPolicy({
-				directives: {
-					// Allow inline scripts ONLY in development for vite dev server
-					scriptSrc: this.umbreld.developmentMode ? ["'self'", "'unsafe-inline'"] : null,
-					// Allow 3rd party app images (remove this if we serve them locally in the future)
-					// Also allow blob: URLs for images being uploaded in Files (since their thumbnails don't exist yet)
-					// and data: URLs for browser-rendered VM cursor images from noVNC.
-					imgSrc: ['*', 'blob:', 'data:'],
-					// Allow fetching data from our apps API (e.g., for Discover page in App Store)
-					connectSrc: ["'self'", 'https://apps.umbrel.com'],
-					// Allow plain text access over the local network
-					upgradeInsecureRequests: null,
-				},
-			}),
-		)
-		this.app.use(helmet.referrerPolicy({policy: 'no-referrer'}))
+		// Security hardening: CSP, referrer policy, nosniff
+		this.app.use(securityHeaders({developmentMode: this.umbreld.developmentMode}))
 		this.app.disable('x-powered-by')
 
 		// Attach the umbreld and logger instances so they're accessible to routes
