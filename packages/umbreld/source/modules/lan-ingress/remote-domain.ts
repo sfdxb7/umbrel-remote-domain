@@ -21,6 +21,9 @@ export type RemoteDomainSettings = {
 	// App ids whose manifest-declared public paths (PROXY_AUTH_WHITELIST) stay
 	// public on the remote domain. Off for every app by default.
 	allowPublicPathApps?: string[]
+	// App ids whose browser-facing extra ports (see remote-app-environment.ts)
+	// get their own hosts. Those hosts skip Umbrel's login, like the LAN ports.
+	allowAppPortApps?: string[]
 	// Reverse proxies whose X-Forwarded-For (or clientIpHeader) umbreld trusts
 	// for remote-domain requests, as IPs or CIDRs. Unset means loopback and
 	// private networks, where a proxy on the same machine or network sits.
@@ -39,6 +42,7 @@ export type RemoteDomain = {
 	allowUnauthenticatedApps: string[]
 	originRewriteDisabledApps: string[]
 	allowPublicPathApps: string[]
+	allowAppPortApps: string[]
 	trustedProxies: string[]
 	clientIpHeader?: string
 }
@@ -158,6 +162,7 @@ export function resolveRemoteDomain(settings: RemoteDomainSettings | undefined):
 		allowUnauthenticatedApps: [...new Set(settings.allowUnauthenticatedApps ?? [])],
 		originRewriteDisabledApps: [...new Set(settings.originRewriteDisabledApps ?? [])],
 		allowPublicPathApps: [...new Set(settings.allowPublicPathApps ?? [])],
+		allowAppPortApps: [...new Set(settings.allowAppPortApps ?? [])],
 		trustedProxies: settings.trustedProxies?.length
 			? settings.trustedProxies.filter((entry) => !validateTrustedProxy(entry))
 			: DEFAULT_TRUSTED_PROXIES,
@@ -182,6 +187,33 @@ export function appRemoteHost(remote: RemoteDomain, appId: string) {
 export function appRemoteOrigin(remote: RemoteDomain, appId: string) {
 	const host = appRemoteHost(remote, appId)
 	return host ? `https://${host}` : undefined
+}
+
+// The host for one of an app's extra ports, `<appId>-<port>-umbrel.<domain>`
+// with the default pattern. A port is all digits, so the last dash splits the
+// app id from the port and two different (app, port) pairs never share a host.
+export function appPortRemoteHost(remote: RemoteDomain, appId: string, port: number) {
+	if (!Number.isInteger(port) || port <= 0 || port > 65_535) return
+	return appRemoteHost(remote, `${appId}-${port}`)
+}
+
+export type AppPortTarget = {appId: string; port: number}
+
+// Build a host -> {appId, port} map for extra ports. An app's own host always
+// wins, so an app whose id ends in a number never loses its host to a port.
+export function buildAppPortHostMap(
+	remote: RemoteDomain,
+	appPorts: Array<[appId: string, ports: number[]]>,
+	appHosts: Map<string, string>,
+) {
+	const hosts = new Map<string, AppPortTarget>()
+	for (const [appId, ports] of appPorts) {
+		for (const port of ports) {
+			const host = appPortRemoteHost(remote, appId, port)
+			if (host && !appHosts.has(host)) hosts.set(host, {appId, port})
+		}
+	}
+	return hosts
 }
 
 // Build a host -> appId map. Ids that collide case-insensitively are dropped
@@ -220,6 +252,7 @@ export type RemoteHostMatch =
 	| {type: 'dashboard'}
 	| {type: 'auth'}
 	| {type: 'app'; appId: string}
+	| ({type: 'port'} & AppPortTarget)
 	| {type: 'unknown'}
 
 // Classify a request by its Host header. Hosts outside the base domain keep
@@ -229,6 +262,7 @@ export function matchRemoteHost(
 	remote: RemoteDomain | undefined,
 	appHosts: Map<string, string>,
 	hostHeader: string | undefined,
+	portHosts?: Map<string, AppPortTarget>,
 ): RemoteHostMatch {
 	if (!remote) return {type: 'outside'}
 	const host = normaliseHostHeader(hostHeader)
@@ -238,6 +272,8 @@ export function matchRemoteHost(
 	if (host === remote.authHost) return {type: 'auth'}
 	const appId = appHosts.get(host)
 	if (appId) return {type: 'app', appId}
+	const port = portHosts?.get(host)
+	if (port) return {type: 'port', ...port}
 	return {type: 'unknown'}
 }
 
@@ -418,4 +454,10 @@ export function isRemoteDomainRequest(remote: RemoteDomain | undefined, hostname
 // host. Off unless the owner allowed it for this app.
 export function remotePublicPathsAllowed(remote: RemoteDomain, appId: string) {
 	return remote.allowPublicPathApps.includes(appId)
+}
+
+// Whether an app's browser-facing extra ports get remote hosts. Off unless the
+// owner allowed it for this app.
+export function remoteAppPortsAllowed(remote: RemoteDomain, appId: string) {
+	return remote.allowAppPortApps.includes(appId)
 }

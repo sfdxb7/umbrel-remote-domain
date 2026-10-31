@@ -20,15 +20,20 @@ import {readNativeTlsPrelude} from './native-tls-preread.js'
 import {getNativeTlsPolicy, matchesNativeTlsHostname, type NativeTlsPolicy} from '../apps/native-tls.js'
 import AppGateway, {readAppGatewayConfig, type AppGatewayConfig} from '../app-gateway/app-gateway.js'
 import {
+	appPortRemoteHost,
 	appRemoteHost,
 	buildAppHostMap,
+	buildAppPortHostMap,
 	lanAppOrigin,
 	matchRemoteHost,
 	normaliseHostHeader,
+	remoteAppPortsAllowed,
 	remotePublicPathsAllowed,
 	resolveRemoteDomain,
+	type AppPortTarget,
 	type RemoteDomain,
 } from './remote-domain.js'
+import {browserFacingPorts} from './remote-app-environment.js'
 
 const NFT_BIN = '/usr/sbin/nft'
 
@@ -49,6 +54,8 @@ type AppIngressRoute = {
 	hiddenPort: number
 	gateway?: AppGatewayConfig
 	nativeTls?: NativeTlsPolicy
+	// Published ports the app hands to the browser (see remote-app-environment.ts).
+	browserPorts?: number[]
 }
 
 type IngressPortMapping = {
@@ -73,6 +80,7 @@ export type RemoteDispatch =
 	| {type: 'dashboard'}
 	| {type: 'auth'}
 	| {type: 'app'; appId: string}
+	| ({type: 'port'} & AppPortTarget)
 	| {type: 'reject'; status: number; message: string}
 
 export type RemoteAppStatus = {
@@ -85,6 +93,10 @@ export type RemoteAppStatus = {
 	// remote domain they need the owner's per-app opt-in.
 	publicPaths: string[]
 	publicPathsAllowed: boolean
+	// Extra ports the app hands to the browser. With the owner's per-app
+	// opt-in each gets its own host, served without Umbrel's login.
+	ports: Array<{port: number; origin: string}>
+	portsAllowed: boolean
 }
 
 // Decide how a dashboard listener handles a Host. Pure so it can be unit tested.
@@ -94,9 +106,12 @@ export type RemoteAppStatus = {
 //   `__Host-` cookie, https handoff and CSP always line up.
 // - Unknown hosts under the domain get a 404 and never fall back to the dashboard.
 // - Apps with Umbrel's login turned off are refused unless explicitly allowed.
+// - Extra port hosts only exist for apps the owner opted in, and follow the
+//   app's own allow decision.
 export function remoteDispatch({
 	remote,
 	appHosts,
+	portHosts,
 	appAuth,
 	host,
 	protocol,
@@ -104,13 +119,14 @@ export function remoteDispatch({
 }: {
 	remote: RemoteDomain | undefined
 	appHosts: Map<string, string>
+	portHosts?: Map<string, AppPortTarget>
 	appAuth: (appId: string) => boolean | undefined
 	host: string | undefined
 	protocol: 'http' | 'https'
 	// Hosts of installed gateway apps whose route is not ready yet.
 	pendingHosts?: Set<string>
 }): RemoteDispatch {
-	const match = matchRemoteHost(remote, appHosts, host)
+	const match = matchRemoteHost(remote, appHosts, host, portHosts)
 	if (match.type === 'outside' || match.type === 'dashboard') return {type: 'dashboard'}
 	if (match.type === 'unknown') {
 		const normalised = normaliseHostHeader(host)
@@ -136,6 +152,10 @@ export function remoteDispatch({
 			message:
 				"This app has Umbrel's login turned off, so it is blocked on the remote domain. The owner can allow it in Settings > Advanced > Remote domain.",
 		}
+	}
+	if (match.type === 'port') {
+		if (!remoteAppPortsAllowed(remote!, match.appId)) return {type: 'reject', status: 404, message: 'Not Found'}
+		return {type: 'port', appId: match.appId, port: match.port}
 	}
 	return {type: 'app', appId: match.appId}
 }
@@ -218,6 +238,11 @@ export default class LanIngress {
 	#remoteDomain?: RemoteDomain
 	#remoteAppHosts = new Map<string, string>()
 	#remoteAuthProxy?: RequestHandler
+	// Extra browser-facing ports of gateway apps, and the hosts that route them.
+	#appBrowserPorts = new Map<string, number[]>()
+	#remotePortHosts = new Map<string, AppPortTarget>()
+	#remotePortProxies = new Map<string, RequestHandler>()
+	#remotePortSockets = new Map<string, Set<net.Socket>>()
 	#remoteRoutesSignature = ''
 	// The mDNS name apps are told about (DEVICE_DOMAIN_NAME), used as the LAN
 	// origin presented to apps for remote requests.
@@ -673,7 +698,12 @@ export default class LanIngress {
 						}
 						return {
 							reservedPorts,
-							route: {id: appId, publicPort, gateway: {...gateway, targetAddress}},
+							route: {
+								id: appId,
+								publicPort,
+								gateway: {...gateway, targetAddress},
+								browserPorts: browserFacingPorts(compose, publicPort),
+							},
 						}
 					}
 
@@ -932,6 +962,7 @@ export default class LanIngress {
 		await this.ensureDashboardHttpsServer()
 		await this.ensureAppAuthMuxServer()
 		await this.updateAppMuxServers(appRoutes)
+		this.#appBrowserPorts = new Map(appRoutes.map((route) => [route.id, route.browserPorts ?? []]))
 		this.updateRemoteAppHosts()
 	}
 
@@ -951,12 +982,34 @@ export default class LanIngress {
 	// Only apps behind the app gateway get a remote host. Directly routed and
 	// non-HTTP apps stay on LAN/Tailscale ports.
 	private updateRemoteAppHosts() {
-		if (!this.#remoteDomain) {
+		const remote = this.#remoteDomain
+		if (!remote) {
 			this.#remoteAppHosts = new Map()
+			this.#remotePortHosts = new Map()
 		} else {
-			this.#remoteAppHosts = buildAppHostMap(this.#remoteDomain, this.remoteGatewayAppIds())
+			this.#remoteAppHosts = buildAppHostMap(remote, this.remoteGatewayAppIds())
+			const appPorts = [...this.#remoteAppHosts.values()]
+				.filter((appId) => remoteAppPortsAllowed(remote, appId))
+				.map((appId): [string, number[]] => [appId, this.remoteAppBrowserPorts(appId)])
+			this.#remotePortHosts = buildAppPortHostMap(remote, appPorts, this.#remoteAppHosts)
 		}
+		this.closeStaleRemotePortRoutes()
 		this.emitRemoteRoutesChangeIfNeeded()
+	}
+
+	private remoteAppBrowserPorts(appId: string) {
+		return this.#appBrowserPorts.get(appId) ?? []
+	}
+
+	// A port host the owner turned off, or whose app stopped, must not keep an
+	// open WebSocket. Its proxy is rebuilt if the host comes back.
+	private closeStaleRemotePortRoutes() {
+		for (const host of new Set([...this.#remotePortProxies.keys(), ...this.#remotePortSockets.keys()])) {
+			if (this.#remotePortHosts.has(host)) continue
+			this.#remotePortProxies.delete(host)
+			for (const socket of this.#remotePortSockets.get(host) ?? []) socket.destroy()
+			this.#remotePortSockets.delete(host)
+		}
 	}
 
 	// apps.list carries each app's remote URL, and gateway routes appear only
@@ -1006,6 +1059,10 @@ export default class LanIngress {
 				const authEnabled = this.remoteAppAuth(appId) !== false
 				const allowed = remote.allowUnauthenticatedApps.includes(appId)
 				const publicPaths = authEnabled ? (this.#appMuxServers.get(appId)?.route.gateway?.authWhitelist ?? []) : []
+				const ports = this.remoteAppBrowserPorts(appId).flatMap((port) => {
+					const portHost = appPortRemoteHost(remote, appId, port)
+					return portHost && !this.#remoteAppHosts.has(portHost) ? [{port, origin: `https://${portHost}`}] : []
+				})
 				return {
 					appId,
 					origin: `https://${host}`,
@@ -1014,6 +1071,8 @@ export default class LanIngress {
 					reachable: authEnabled || allowed,
 					publicPaths,
 					publicPathsAllowed: publicPaths.length > 0 && remotePublicPathsAllowed(remote, appId),
+					ports,
+					portsAllowed: ports.length > 0 && remoteAppPortsAllowed(remote, appId),
 				}
 			})
 			.sort((a, b) => a.appId.localeCompare(b.appId))
@@ -1040,6 +1099,7 @@ export default class LanIngress {
 		return remoteDispatch({
 			remote: this.#remoteDomain,
 			appHosts: this.#remoteAppHosts,
+			portHosts: this.#remotePortHosts,
 			appAuth: (id) => this.remoteAppAuth(id),
 			host,
 			protocol,
@@ -1065,6 +1125,22 @@ export default class LanIngress {
 				internalUpgradeSubscription: false,
 			})
 			return entry.remoteProxy
+		}
+		if (dispatch.type === 'port') {
+			// Straight to the app's published port, like a LAN request to it. The
+			// Host header and path are kept as the browser sent them, since S3
+			// presigned URLs sign both. No Umbrel login: requests from the app's
+			// page to this host cannot carry the app host's `__Host-` cookie.
+			const host = appPortRemoteHost(this.#remoteDomain!, dispatch.appId, dispatch.port)!
+			let proxy = this.#remotePortProxies.get(host)
+			if (!proxy) {
+				proxy = this.createProxyMiddleware(dispatch.port, 'https', {
+					includeForwardedFor: false,
+					internalUpgradeSubscription: false,
+				})
+				this.#remotePortProxies.set(host, proxy)
+			}
+			return proxy
 		}
 	}
 
@@ -1115,6 +1191,13 @@ export default class LanIngress {
 			socket.write(`HTTP/1.1 ${status} ${http.STATUS_CODES[status] ?? 'Error'}\r\nConnection: close\r\n\r\n`)
 			socket.destroy()
 			return true
+		}
+		if (dispatch.type === 'port') {
+			const host = appPortRemoteHost(this.#remoteDomain!, dispatch.appId, dispatch.port)!
+			const sockets = this.#remotePortSockets.get(host) ?? new Set<net.Socket>()
+			this.#remotePortSockets.set(host, sockets)
+			sockets.add(socket)
+			socket.once('close', () => sockets.delete(socket))
 		}
 		handler.upgrade(request as any, socket, head)
 		return true

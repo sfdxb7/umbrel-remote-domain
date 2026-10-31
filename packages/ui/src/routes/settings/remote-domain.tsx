@@ -21,6 +21,7 @@ type Draft = {
 	allowUnauthenticatedApps: string[]
 	originRewriteDisabledApps: string[]
 	allowPublicPathApps: string[]
+	allowAppPortApps: string[]
 	trustedProxies: string[]
 	clientIpHeader: string
 }
@@ -50,6 +51,7 @@ export function RemoteDomainSettingsPanel({onBack}: {onBack: () => void}) {
 		allowUnauthenticatedApps: 'allowUnauthenticatedApps' in data ? data.allowUnauthenticatedApps : [],
 		originRewriteDisabledApps: 'originRewriteDisabledApps' in data ? data.originRewriteDisabledApps : [],
 		allowPublicPathApps: 'allowPublicPathApps' in data ? data.allowPublicPathApps : [],
+		allowAppPortApps: 'allowAppPortApps' in data ? data.allowAppPortApps : [],
 		trustedProxies: 'trustedProxies' in data ? data.trustedProxies : [],
 		clientIpHeader: 'clientIpHeader' in data ? data.clientIpHeader : '',
 	}
@@ -73,10 +75,13 @@ export function RemoteDomainSettingsPanel({onBack}: {onBack: () => void}) {
 
 	const save = async (next: Draft, {keepDraft = false} = {}) => {
 		try {
-			await setMut.mutateAsync(next)
+			const {restartRequired} = await setMut.mutateAsync(next)
 			if (!keepDraft) setDraft(next)
 			await Promise.all([utils.lanIngress.getRemoteDomain.invalidate(), utils.apps.list.invalidate()])
 			toast.success(t('remote-domain.saved'), {area: 'settings'})
+			if (restartRequired.length > 0) {
+				toast.info(t('remote-domain.restart-required', {apps: restartRequired.join(', ')}), {area: 'settings'})
+			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : t('unknown-error')
 			toast.error(t('remote-domain.save-error', {message}), {area: 'settings'})
@@ -105,6 +110,16 @@ export function RemoteDomainSettingsPanel({onBack}: {onBack: () => void}) {
 		const allowPublicPathApps = [...allow]
 		void save({...saved, allowPublicPathApps}, {keepDraft: true})
 		update({allowPublicPathApps})
+	}
+
+	const toggleAppPorts = (appId: string, allowed: boolean) => {
+		if (!saved) return
+		const allow = new Set(saved.allowAppPortApps)
+		if (allowed) allow.add(appId)
+		else allow.delete(appId)
+		const allowAppPortApps = [...allow]
+		void save({...saved, allowAppPortApps}, {keepDraft: true})
+		update({allowAppPortApps})
 	}
 
 	// A remote domain puts the login page on the internet. Nudge the owner
@@ -232,6 +247,7 @@ export function RemoteDomainSettingsPanel({onBack}: {onBack: () => void}) {
 				<div className='flex flex-col gap-y-2'>
 					<h4 className='px-1 text-14 font-medium'>{t('remote-domain.apps-title')}</h4>
 					<p className='px-1 text-12 leading-tight text-white/45'>{t('remote-domain.apps-description')}</p>
+					<p className='px-1 text-12 leading-tight text-white/45'>{t('remote-domain.apps-restart-note')}</p>
 					{apps.map((app) => (
 						<div key={app.appId} className={cn(cardClass, 'flex-col gap-y-3')}>
 							<div className='flex w-full items-start gap-x-2'>
@@ -265,6 +281,21 @@ export function RemoteDomainSettingsPanel({onBack}: {onBack: () => void}) {
 										checked={app.publicPathsAllowed}
 										disabled={setMut.isPending}
 										onCheckedChange={(allowed) => togglePublicPaths(app.appId, allowed)}
+									/>
+								</div>
+							)}
+							{app.ports.length > 0 && (app.authEnabled || app.allowed) && (
+								<div className='flex w-full items-start gap-x-2 border-t border-white/6 pt-3'>
+									<div className='min-w-0 flex-1 space-y-1'>
+										<h4 className='text-13 leading-tight font-medium'>{t('remote-domain.app-ports')}</h4>
+										<p className='text-12 leading-tight break-all opacity-45'>
+											{t('remote-domain.app-ports-help', {origins: app.ports.map((port) => port.origin).join(', ')})}
+										</p>
+									</div>
+									<Switch
+										checked={app.portsAllowed}
+										disabled={setMut.isPending}
+										onCheckedChange={(allowed) => toggleAppPorts(app.appId, allowed)}
 									/>
 								</div>
 							)}

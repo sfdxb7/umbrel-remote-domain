@@ -2,13 +2,16 @@ import {describe, expect, test} from 'vitest'
 
 import {
 	DEFAULT_TRUSTED_PROXIES,
+	appPortRemoteHost,
 	appRemoteHost,
 	buildAppHostMap,
+	buildAppPortHostMap,
 	isRemoteAuthRequest,
 	isRemoteDomainRequest,
 	lanAppOrigin,
 	matchRemoteHost,
 	normaliseHostHeader,
+	remoteAppPortsAllowed,
 	remotePublicPathsAllowed,
 	remoteAppAuthUrl,
 	remoteOriginRewrite,
@@ -42,6 +45,7 @@ describe('remote domain settings', () => {
 			allowUnauthenticatedApps: [],
 			originRewriteDisabledApps: [],
 			allowPublicPathApps: [],
+			allowAppPortApps: [],
 			trustedProxies: DEFAULT_TRUSTED_PROXIES,
 			clientIpHeader: undefined,
 		})
@@ -216,6 +220,76 @@ describe('remoteDispatch()', () => {
 	test('does nothing while the mode is off', () => {
 		expect(
 			remoteDispatch({remote: undefined, appHosts, appAuth, host: 'nextcloud-umbrel.example.com', protocol: 'https'}),
+		).toEqual({type: 'dashboard'})
+	})
+})
+
+describe('extra app ports', () => {
+	const portRemote = resolveRemoteDomain({
+		enabled: true,
+		baseDomain: 'example.com',
+		allowUnauthenticatedApps: ['lobe-chat'],
+		allowAppPortApps: ['lobe-chat', 'nextcloud', 'transmission', 'lobe-chat'],
+	})!
+	const appHosts = buildAppHostMap(portRemote, ['lobe-chat', 'nextcloud', 'transmission', 'files', 'files-8080'])
+	const portHosts = buildAppPortHostMap(
+		portRemote,
+		[
+			['lobe-chat', [7458, 7459]],
+			['transmission', [9091]],
+			['files', [8080, 8081]],
+		],
+		appHosts,
+	)
+	const appAuth = (appId: string) => ({'lobe-chat': false, nextcloud: true, transmission: false})[appId]
+	const dispatch = (host: string, protocol: 'http' | 'https' = 'https', remote = portRemote) =>
+		remoteDispatch({remote, appHosts, portHosts, appAuth, host, protocol})
+
+	test('each port gets its own host under the app pattern', () => {
+		expect(portRemote.allowAppPortApps).toEqual(['lobe-chat', 'nextcloud', 'transmission'])
+		expect(appPortRemoteHost(portRemote, 'lobe-chat', 7458)).toBe('lobe-chat-7458-umbrel.example.com')
+		expect(appPortRemoteHost(portRemote, 'lobe-chat', 0)).toBeUndefined()
+		expect(appPortRemoteHost(portRemote, 'lobe-chat', 70_000)).toBeUndefined()
+		// An app's own host wins over another app's port host with the same name.
+		expect(portHosts.get('files-8080-umbrel.example.com')).toBeUndefined()
+		expect(portHosts.get('files-8081-umbrel.example.com')).toEqual({appId: 'files', port: 8081})
+		expect(matchRemoteHost(portRemote, appHosts, 'files-8080-umbrel.example.com', portHosts)).toEqual({
+			type: 'app',
+			appId: 'files-8080',
+		})
+	})
+
+	test('routes opted-in ports over HTTPS only', () => {
+		expect(dispatch('lobe-chat-7458-umbrel.example.com')).toEqual({type: 'port', appId: 'lobe-chat', port: 7458})
+		expect(dispatch('Lobe-Chat-7459-umbrel.example.com:443')).toEqual({type: 'port', appId: 'lobe-chat', port: 7459})
+		expect(dispatch('lobe-chat-7458-umbrel.example.com', 'http')).toMatchObject({type: 'reject', status: 421})
+		expect(dispatch('lobe-chat-7460-umbrel.example.com')).toMatchObject({type: 'reject', status: 404})
+	})
+
+	test('follows the app allow decision and the per-app opt-in', () => {
+		// Umbrel's login is off and the app is not allowed: its ports are blocked too.
+		expect(dispatch('transmission-9091-umbrel.example.com')).toMatchObject({type: 'reject', status: 403})
+		// Not opted in: the host does not exist.
+		expect(dispatch('files-8081-umbrel.example.com')).toMatchObject({type: 'reject', status: 404})
+		const optedOut = resolveRemoteDomain({
+			enabled: true,
+			baseDomain: 'example.com',
+			allowUnauthenticatedApps: ['lobe-chat'],
+		})!
+		expect(remoteAppPortsAllowed(optedOut, 'lobe-chat')).toBe(false)
+		expect(dispatch('lobe-chat-7458-umbrel.example.com', 'https', optedOut)).toMatchObject({
+			type: 'reject',
+			status: 404,
+		})
+		expect(
+			remoteDispatch({
+				remote: undefined,
+				appHosts,
+				portHosts,
+				appAuth,
+				host: 'lobe-chat-7458-umbrel.example.com',
+				protocol: 'https',
+			}),
 		).toEqual({type: 'dashboard'})
 	})
 })

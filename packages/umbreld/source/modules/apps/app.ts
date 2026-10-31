@@ -48,6 +48,8 @@ import {
 } from './schema.js'
 import appScript from './legacy-compat/app-script.js'
 import {readAppGatewayConfig} from '../app-gateway/app-gateway.js'
+import {resolveRemoteDomain} from '../lan-ingress/remote-domain.js'
+import {remoteAppEnvironment} from '../lan-ingress/remote-app-environment.js'
 import {OWNER_USER_ID} from '../user/constants.js'
 
 async function readYaml(path: string) {
@@ -1970,16 +1972,32 @@ export default class App {
 			service.environment[variable.name] = variable.value
 		}
 
-		if (Object.keys(userSettingsCompose.services).length === 0) {
-			await fse.remove(this.userSettingsComposePath)
-			return
-		}
-
 		// Docker Compose interpolates $VAR and ${VAR} in every compose file it loads,
 		// including this override, so a literal '$' in a value (e.g. a password like
 		// 'pa$$word' or a folder path) would be mangled into a variable reference.
 		// Escaping '$' to '$$' at serialization keeps every generated value literal.
 		escapeComposeInterpolation(userSettingsCompose)
+
+		// Remote domain mode adds the app's remote origin to its trusted-origin
+		// lists and points its browser-facing extra ports at their remote hosts.
+		// These values extend the app's own Compose values, so they keep its
+		// ${...} references and are added after escaping. The user's values win.
+		const remoteEnvironment = remoteAppEnvironment({
+			remote: resolveRemoteDomain(await this.#umbreld.store.get('settings.remoteDomain')),
+			appId: this.id,
+			compose,
+			mainPort: Number(manifest.port),
+		})
+		for (const [serviceName, environment] of Object.entries(remoteEnvironment)) {
+			const service = (userSettingsCompose.services[serviceName] ??= {})
+			service.environment ??= {}
+			for (const [name, value] of Object.entries(environment)) service.environment[name] ??= value
+		}
+
+		if (Object.keys(userSettingsCompose.services).length === 0) {
+			await fse.remove(this.userSettingsComposePath)
+			return
+		}
 
 		await fse.writeFile(
 			this.userSettingsComposePath,

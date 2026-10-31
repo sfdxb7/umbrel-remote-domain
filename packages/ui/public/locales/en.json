@@ -2829,5 +2829,9 @@
   "remote-domain.client-ip-header": "Client IP header",
   "remote-domain.client-ip-header-help": "Optional. A header your trusted proxy sets to the visitor's IP, such as X-Real-IP. Leave empty to use X-Forwarded-For.",
   "remote-domain.public-paths": "Allow public paths on the remote domain",
-  "remote-domain.public-paths-help": "This app makes {{paths}} reachable without Umbrel's login. On the remote domain those paths stay behind the login unless you allow them here. Only allow this if the app protects them itself."
+  "remote-domain.public-paths-help": "This app makes {{paths}} reachable without Umbrel's login. On the remote domain those paths stay behind the login unless you allow them here. Only allow this if the app protects them itself.",
+  "remote-domain.app-ports": "Route this app's extra ports",
+  "remote-domain.app-ports-help": "This app sends your browser to its other ports ({{origins}}), for example for uploads or a live connection. Allowing this serves them on those hosts without Umbrel's login, the same way they are open on your local network. Only allow this if the app protects them itself. Restart the app afterwards.",
+  "remote-domain.restart-required": "Restart these apps to apply the change: {{apps}}",
+  "remote-domain.apps-restart-note": "Apps read their remote-domain settings when they start. After changing the domain or an app's extra ports, restart the affected apps."
 }

@@ -52,6 +52,7 @@ async function createApp({
 	])
 
 	const globalStore = {
+		get: vi.fn(async () => undefined),
 		getWriteLock: vi.fn(async (job) =>
 			job({
 				get: vi.fn(async (key: string) => (key === 'apps' ? [appId] : [])),

@@ -64,6 +64,29 @@ For remote-domain requests that have passed Umbrel app login (or that come from 
 
 **Per-app override.** Apps that compare `Origin` with `X-Forwarded-Host` before `Host` (for example Next.js server actions and Rails), or that build page URLs from the raw `Host`, should get the browser's original headers. Add the app ID under **Advanced → Send the original Host and Origin headers to these apps**, or over tRPC with `originRewriteDisabledApps: ["some-app"]`. Those apps get the original `Host`, `Origin` and `Referer`, plus `X-Forwarded-Host`/`X-Forwarded-Proto`. The setting keeps its `originRewriteDisabledApps` name for compatibility.
 
+### App environment and extra ports
+
+Some checks live in the app's own configuration, not in headers, so the gateway's header rewrite cannot reach them. A Better Auth login, for example, posts its `callbackURL` in the request body and checks it against `AUTH_TRUSTED_ORIGINS`. Some apps also hand the browser LAN URLs to their other ports, such as an S3 endpoint for uploads or a WebSocket gateway. umbreld never rewrites request or response bodies. Instead, while the mode is on, it adjusts the app's environment:
+
+- **Trusted origins.** If a service of the app sets `AUTH_TRUSTED_ORIGINS`, `BETTER_AUTH_TRUSTED_ORIGINS`, `AUTH_ADDITIONAL_TRUSTED_ORIGINS` or `CSRF_TRUSTED_ORIGINS`, the app's remote origin is appended to the comma-separated list. The LAN entries stay.
+- **Extra ports (opt-in per app).** A published port of the app, other than its main port, counts as browser-facing when the app's own Compose file sets an environment value to a LAN URL for it: `http://${DEVICE_DOMAIN_NAME}:<port>` (or `$DEVICE_DOMAIN_NAME`, `${DEVICE_HOSTNAME}.local`, `umbrel.local`). Ports the app never hands out stay LAN-only. When the owner turns on **Route this app's extra ports** on the app's card, each browser-facing port gets its own host, `<appId>-<port>-umbrel.<domain>` with the default pattern, and those values are rewritten to it (path kept). Variables that point at a container name, such as `S3_INTERNAL_ENDPOINT`, are not touched.
+
+Only apps behind the app gateway get these changes. Variables the user set in the app's settings win over them. Variables that only exist in an `env_file` are not seen.
+
+**Where it is written.** The values go into the app's generated Compose override, `docker-compose.umbrel-user-settings.yml` in the app's data directory, next to the user's custom environment. umbreld regenerates that file on every install, start, restart and update, so the values survive app store updates and disappear on the next start after the mode is turned off. Compose only applies environment when containers are created, so **affected apps need a restart** after the domain, the app pattern or an app's extra-port switch changes. Saving the settings lists the running apps that need one.
+
+**Extra port hosts.** A port host goes straight to the app's published port, like a LAN request to that port. The `Host` header and path are passed through unchanged, because S3 presigned URLs sign both; this is also why each port gets a host instead of a path prefix on the app's host. WebSockets work. There is **no Umbrel login** on port hosts: the app's page calls them from another origin (a presigned upload, a cross-origin WebSocket), and those requests cannot carry the app host's `__Host-` login cookie, so a login wall would break exactly these requests. This matches the LAN, where these ports are open to anyone on the network, but on the remote domain they are open to the internet. That is why the switch is off by default and should only be turned on when the app protects those ports itself. Port hosts also follow the app's own allow decision: if the app is blocked on the remote domain, so are its ports. Turning the switch off closes open WebSockets on its hosts.
+
+For example, lobe-chat (main port `7455`) with the mode on for `example.com` and its extra ports allowed gets:
+
+| Variable | LAN value | With remote domain mode |
+| --- | --- | --- |
+| `AUTH_TRUSTED_ORIGINS` | `http://${DEVICE_DOMAIN_NAME}:7455` | `http://${DEVICE_DOMAIN_NAME}:7455,https://lobe-chat-umbrel.example.com` |
+| `S3_ENDPOINT` | `http://${DEVICE_DOMAIN_NAME}:7458` | `https://lobe-chat-7458-umbrel.example.com` |
+| `AGENT_GATEWAY_URL` | `http://${DEVICE_DOMAIN_NAME}:7459` | `https://lobe-chat-7459-umbrel.example.com` |
+
+`APP_URL` (the main port), the internal endpoints and the unreferenced device gateway port `7460` are left alone. Because the rewritten URLs are public, LAN browsers use them too while the mode is on. Without the extra-port switch, lobe-chat only gets the trusted origin, which fixes sign-in.
+
 ## Reverse proxy requirements
 
 Any reverse proxy or tunnel works if it:
@@ -241,4 +264,5 @@ The settings page warns the owner when 2FA is off. Turning on 2FA for every acco
 - `X-Forwarded-For` is only used to find the client address for login throttling. The secure context comes from the proxy → :443 hop being HTTPS, not from `X-Forwarded-Proto`.
 - Login throttling state is kept in memory, so it resets when umbreld restarts.
 - Upstream apps see a LAN `Host`/`Origin`/`Referer`. Apps that build absolute URLs in page bodies from the raw `Host` (instead of `X-Forwarded-Host`) produce LAN URLs; redirects are fixed up, page bodies are not. Use the per-app override for such apps.
-- Only the app's main port is routed. Extra ports an app hands to the browser (for example a separate S3 or gateway port) stay LAN-only.
+- Extra ports are only routed when the app's Compose file hands them out as a `${DEVICE_DOMAIN_NAME}`-style LAN URL and the owner allowed them, and only after the app restarts. Ports an app only mentions in an `env_file`, in its own settings or in page bodies stay LAN-only.
+- Port hosts have no Umbrel login (see [App environment and extra ports](#app-environment-and-extra-ports)).

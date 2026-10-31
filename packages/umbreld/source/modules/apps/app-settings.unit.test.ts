@@ -38,6 +38,7 @@ async function createApp() {
 			virtualToSystemPathUnsafe: vi.fn((virtualPath: string) => path.join(dataDirectory, virtualPath)),
 		},
 		lanIngress: {refresh: vi.fn(async () => undefined)},
+		store: {get: vi.fn(async () => undefined)},
 	} as unknown as Umbreld
 
 	async function addApp(id: string, manifest: Partial<AppManifest>) {
@@ -226,4 +227,59 @@ describe('app storage source normalization', () => {
 			expect(normalizeAppMountTargetPath(normalized)).toBe(normalized)
 		},
 	)
+})
+
+describe('remote domain app environment', () => {
+	test('adds trusted origins and extra port URLs to the generated Compose override', async () => {
+		const {app, umbreld} = await createApp()
+		await app.writeCompose({
+			services: {
+				app_proxy: {environment: {APP_HOST: 'test-app_server_1', APP_PORT: 3210}},
+				server: {
+					image: 'example/server',
+					environment: {
+						APP_URL: 'http://${DEVICE_DOMAIN_NAME}:7455',
+						AUTH_TRUSTED_ORIGINS: 'http://${DEVICE_DOMAIN_NAME}:7455',
+						S3_ENDPOINT: 'http://${DEVICE_DOMAIN_NAME}:7458',
+					},
+				},
+				storage: {image: 'example/storage', ports: ['7458:9000']},
+			},
+		})
+		await fse.writeFile(
+			path.join(app.dataDirectory, 'umbrel-app.yml'),
+			yaml.dump({manifestVersion: '1.0.0', port: 7455}),
+		)
+		const settings = {enabled: true, baseDomain: 'example.com', allowAppPortApps: ['test-app']}
+		Object.assign(umbreld, {
+			store: {get: vi.fn(async (key: string) => (key === 'settings.remoteDomain' ? settings : undefined))},
+		})
+
+		await app.regenerateUserSettingsCompose()
+		expect(yaml.load(await fse.readFile(app.userSettingsComposePath, 'utf8'))).toEqual({
+			services: {
+				server: {
+					environment: {
+						AUTH_TRUSTED_ORIGINS: 'http://${DEVICE_DOMAIN_NAME}:7455,https://test-app-umbrel.example.com',
+						S3_ENDPOINT: 'https://test-app-7458-umbrel.example.com',
+					},
+				},
+			},
+		})
+
+		// A value the user set in the app's settings wins.
+		await app.store.set('customEnvironment', [
+			{serviceName: 'server', name: 'S3_ENDPOINT', value: 'https://files.example.net'},
+		])
+		await app.regenerateUserSettingsCompose()
+		expect(yaml.load(await fse.readFile(app.userSettingsComposePath, 'utf8'))).toMatchObject({
+			services: {server: {environment: {S3_ENDPOINT: 'https://files.example.net'}}},
+		})
+		await app.store.set('customEnvironment', [])
+
+		// Turning the mode off removes the values on the next regeneration.
+		settings.enabled = false
+		await app.regenerateUserSettingsCompose()
+		await expect(fse.pathExists(app.userSettingsComposePath)).resolves.toBe(false)
+	})
 })
