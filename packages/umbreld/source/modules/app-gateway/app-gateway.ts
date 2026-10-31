@@ -172,7 +172,7 @@ export function remoteLoginRedirect(
 	return remoteAppAuthUrl(remote, appId, safeRedirectPath(originalUrl))
 }
 
-function hostWithPort(hostname: string, port: number) {
+export function hostWithPort(hostname: string, port: number) {
 	const host = hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname
 	return host.includes(':') ? `[${host}]:${port}` : `${host}:${port}`
 }

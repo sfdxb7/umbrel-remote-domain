@@ -16,7 +16,13 @@ type Internals = {
 	remoteAppAuth(appId: string): boolean | undefined
 	updateRemoteAppHosts(): void
 	remoteDispatchFor(host: string, protocol: 'https'): unknown
-	remoteAppBrowserPorts(appId: string): number[]
+	remoteAppBrowserPorts(appId: string): Array<{port: number; upstream?: {host: string; port: number}}>
+	resolveBrowserPorts(
+		appId: string,
+		compose: unknown,
+		ports: number[],
+	): Promise<Array<{port: number; upstream?: {host: string; port: number}}>>
+	inspectContainerAddress(container: string): Promise<string | null>
 	handleRemoteRequest(
 		request: http.IncomingMessage,
 		response: http.ServerResponse,
@@ -44,10 +50,10 @@ describe('LAN ingress remote routes follow the app lifecycle', () => {
 		await Promise.all(servers.splice(0).map((server) => new Promise((resolve) => server.close(resolve))))
 	})
 
-	async function listen(server: http.Server) {
+	async function listen(server: http.Server, host = '127.0.0.1') {
 		servers.push(server)
 		server.on('connection', (socket) => sockets.add(socket))
-		server.listen(0, '127.0.0.1')
+		server.listen(0, host)
 		await once(server, 'listening')
 		return (server.address() as net.AddressInfo).port
 	}
@@ -154,25 +160,35 @@ describe('LAN ingress remote routes follow the app lifecycle', () => {
 		expect(emitted).toEqual(['lan-ingress:remote-routes:change'])
 	})
 
-	test('routes an opted-in extra port to its published port, with WebSockets, and closes them when it stops', async () => {
-		// The app's published port: echoes what it received and accepts upgrades.
+	test('routes an opted-in extra port to its service container, with WebSockets, and closes them when it stops', async () => {
+		// The service's container: echoes what it received and accepts upgrades.
+		// It listens on its own address (127.0.0.2 stands in for the container IP),
+		// not on the published host port, which umbreld in a container cannot reach.
 		const upstream = http.createServer((request, response) => {
 			response.end(JSON.stringify({url: request.url, headers: request.headers}))
 		})
 		upstream.on('upgrade', (_request, socket) => {
 			socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
 		})
-		const appPort = await listen(upstream)
+		const containerPort = await listen(upstream, '127.0.0.2')
 
 		const settings = {...enabled, allowAppPortApps: ['nextcloud']}
 		const {ingress, internals, setGatewayApps} = createIngress(settings)
-		vi.spyOn(internals, 'remoteAppBrowserPorts').mockImplementation((appId) => (appId === 'nextcloud' ? [appPort] : []))
+		// No container_name: resolved through Compose's <app>_<service>_1 name.
+		const inspect = vi
+			.spyOn(internals, 'inspectContainerAddress')
+			.mockImplementation(async (container) => (container === 'nextcloud_s3_1' ? '127.0.0.2' : null))
+		const compose = {services: {s3: {ports: [`7458:${containerPort}`]}}}
+		const resolved = await internals.resolveBrowserPorts('nextcloud', compose, [7458])
+		expect(inspect).toHaveBeenCalledWith('nextcloud_s3_1')
+		expect(resolved).toEqual([{port: 7458, upstream: {host: '127.0.0.2', port: containerPort}}])
+		vi.spyOn(internals, 'remoteAppBrowserPorts').mockImplementation((appId) => (appId === 'nextcloud' ? resolved : []))
 		await start(ingress)
 		internals.updateRemoteAppHosts()
-		const portHost = `nextcloud-${appPort}-umbrel.example.com`
+		const portHost = 'nextcloud-7458-umbrel.example.com'
 		expect(ingress.remoteAppStatus()[0]).toMatchObject({
 			appId: 'nextcloud',
-			ports: [{port: appPort, origin: `https://${portHost}`}],
+			ports: [{port: 7458, origin: `https://${portHost}`}],
 			portsAllowed: true,
 		})
 
@@ -218,9 +234,30 @@ describe('LAN ingress remote routes follow the app lifecycle', () => {
 		expect((await get(portHost)).status).toBe(404)
 	})
 
+	test('answers 502 and refreshes while an extra port has no resolved container', async () => {
+		const {ingress, internals} = createIngress({...enabled, allowAppPortApps: ['nextcloud']})
+		vi.spyOn(internals, 'remoteAppBrowserPorts').mockImplementation(() => [{port: 7458}])
+		const refresh = await start(ingress)
+		internals.updateRemoteAppHosts()
+		const front = http.createServer((request, response) => {
+			internals.handleRemoteRequest(request, response, 'https', 0)
+		})
+		const frontPort = await listen(front)
+		const status = await new Promise<number>((resolve, reject) => {
+			http
+				.get({port: frontPort, headers: {host: 'nextcloud-7458-umbrel.example.com'}}, (response) => {
+					response.resume()
+					resolve(response.statusCode!)
+				})
+				.on('error', reject)
+		})
+		expect(status).toBe(502)
+		expect(refresh).toHaveBeenCalledTimes(1)
+	})
+
 	test('does not route extra ports the owner did not allow', async () => {
 		const {ingress, internals} = createIngress(enabled)
-		vi.spyOn(internals, 'remoteAppBrowserPorts').mockImplementation(() => [7458])
+		vi.spyOn(internals, 'remoteAppBrowserPorts').mockImplementation(() => [{port: 7458}])
 		await start(ingress)
 		internals.updateRemoteAppHosts()
 		expect(ingress.remoteAppStatus()[0]).toMatchObject({

@@ -18,7 +18,7 @@ import runEvery from '../utilities/run-every.js'
 import {forwardTcp} from './forward-tcp.js'
 import {readNativeTlsPrelude} from './native-tls-preread.js'
 import {getNativeTlsPolicy, matchesNativeTlsHostname, type NativeTlsPolicy} from '../apps/native-tls.js'
-import AppGateway, {readAppGatewayConfig, type AppGatewayConfig} from '../app-gateway/app-gateway.js'
+import AppGateway, {hostWithPort, readAppGatewayConfig, type AppGatewayConfig} from '../app-gateway/app-gateway.js'
 import {
 	appPortRemoteHost,
 	appRemoteHost,
@@ -33,7 +33,7 @@ import {
 	type AppPortTarget,
 	type RemoteDomain,
 } from './remote-domain.js'
-import {browserFacingPorts} from './remote-app-environment.js'
+import {browserFacingPorts, publishedPortTargets} from './remote-app-environment.js'
 
 const NFT_BIN = '/usr/sbin/nft'
 
@@ -55,8 +55,12 @@ type AppIngressRoute = {
 	gateway?: AppGatewayConfig
 	nativeTls?: NativeTlsPolicy
 	// Published ports the app hands to the browser (see remote-app-environment.ts).
-	browserPorts?: number[]
+	browserPorts?: BrowserPortRoute[]
 }
+
+// An extra port and the container address behind it. upstream is missing
+// while the service's container cannot be resolved.
+type BrowserPortRoute = {port: number; upstream?: {host: string; port: number}}
 
 type IngressPortMapping = {
 	publicPort: number
@@ -73,6 +77,9 @@ type UmbrelProxyOptions = {
 	// after the first request when ws is true. Listeners that dispatch upgrades
 	// themselves must turn that off so only the chosen upstream gets the socket.
 	internalUpgradeSubscription?: boolean
+	// Proxy to this host instead of loopback (extra ports go to a container).
+	upstreamHost?: string
+	onUpstreamError?: () => void
 }
 
 // What the dashboard listeners should do with a request, based on its Host.
@@ -239,9 +246,9 @@ export default class LanIngress {
 	#remoteAppHosts = new Map<string, string>()
 	#remoteAuthProxy?: RequestHandler
 	// Extra browser-facing ports of gateway apps, and the hosts that route them.
-	#appBrowserPorts = new Map<string, number[]>()
+	#appBrowserPorts = new Map<string, BrowserPortRoute[]>()
 	#remotePortHosts = new Map<string, AppPortTarget>()
-	#remotePortProxies = new Map<string, RequestHandler>()
+	#remotePortProxies = new Map<string, {upstream: string; proxy: RequestHandler}>()
 	#remotePortSockets = new Map<string, Set<net.Socket>>()
 	#remoteRoutesSignature = ''
 	// The mDNS name apps are told about (DEVICE_DOMAIN_NAME), used as the LAN
@@ -702,7 +709,7 @@ export default class LanIngress {
 								id: appId,
 								publicPort,
 								gateway: {...gateway, targetAddress},
-								browserPorts: browserFacingPorts(compose, publicPort),
+								browserPorts: await this.resolveBrowserPorts(appId, compose, browserFacingPorts(compose, publicPort)),
 							},
 						}
 					}
@@ -773,6 +780,27 @@ export default class LanIngress {
 		}
 	}
 
+	// Extra ports are routed to the service's container on its container port,
+	// resolved the same way as the app gateway target. The published host port
+	// is not used: when umbreld runs in a container it is not on umbreld's
+	// loopback, while the container address works on the host and in a
+	// container on umbrel_main_network alike.
+	private async resolveBrowserPorts(appId: string, compose: ComposeFile | null, ports: number[]) {
+		const targets = publishedPortTargets(compose)
+		return Promise.all(
+			ports.map(async (port): Promise<BrowserPortRoute> => {
+				const target = targets.get(port)
+				if (!target?.containerPort) return {port}
+				// umbrelOS pins container_name to <app>_<service>_1; a missing one
+				// falls back to Compose's project and service labels.
+				const containerName = compose?.services?.[target.service]?.container_name
+				const name = typeof containerName === 'string' ? containerName : `${appId}_${target.service}_1`
+				const host = await this.resolveAppTarget(appId, name, compose)
+				return host ? {port, upstream: {host, port: target.containerPort}} : {port}
+			}),
+		)
+	}
+
 	private async resolveAppTarget(appId: string, host: string, compose: ComposeFile | null) {
 		if (net.isIP(host)) return host
 
@@ -814,6 +842,16 @@ export default class LanIngress {
 			.finally(() => this.#appTargetRecoveries.delete(config.appId))
 		this.#appTargetRecoveries.set(config.appId, recovery)
 		return recovery
+	}
+
+	// A container that restarted on its own can come back on a new address, and
+	// one that was still starting had none at the last refresh. Refresh again,
+	// rate-limited like the gateway recovery above.
+	private requestBrowserPortRecovery(appId: string) {
+		const key = `ports:${appId}`
+		if (Date.now() < (this.#nextAppTargetRecoveryAt.get(key) ?? 0)) return
+		this.#nextAppTargetRecoveryAt.set(key, Date.now() + APP_TARGET_RECOVERY_COOLDOWN)
+		this.refresh().catch((error) => this.logger.error(`Failed to refresh extra port routes for ${appId}`, error))
 	}
 
 	private async recoverAppTarget(config: AppGatewayConfig) {
@@ -990,7 +1028,7 @@ export default class LanIngress {
 			this.#remoteAppHosts = buildAppHostMap(remote, this.remoteGatewayAppIds())
 			const appPorts = [...this.#remoteAppHosts.values()]
 				.filter((appId) => remoteAppPortsAllowed(remote, appId))
-				.map((appId): [string, number[]] => [appId, this.remoteAppBrowserPorts(appId)])
+				.map((appId): [string, number[]] => [appId, this.remoteAppBrowserPorts(appId).map(({port}) => port)])
 			this.#remotePortHosts = buildAppPortHostMap(remote, appPorts, this.#remoteAppHosts)
 		}
 		this.closeStaleRemotePortRoutes()
@@ -1059,7 +1097,7 @@ export default class LanIngress {
 				const authEnabled = this.remoteAppAuth(appId) !== false
 				const allowed = remote.allowUnauthenticatedApps.includes(appId)
 				const publicPaths = authEnabled ? (this.#appMuxServers.get(appId)?.route.gateway?.authWhitelist ?? []) : []
-				const ports = this.remoteAppBrowserPorts(appId).flatMap((port) => {
+				const ports = this.remoteAppBrowserPorts(appId).flatMap(({port}) => {
 					const portHost = appPortRemoteHost(remote, appId, port)
 					return portHost && !this.#remoteAppHosts.has(portHost) ? [{port, origin: `https://${portHost}`}] : []
 				})
@@ -1127,20 +1165,31 @@ export default class LanIngress {
 			return entry.remoteProxy
 		}
 		if (dispatch.type === 'port') {
-			// Straight to the app's published port, like a LAN request to it. The
+			// Straight to the service's container (see resolveBrowserPorts). The
 			// Host header and path are kept as the browser sent them, since S3
 			// presigned URLs sign both. No Umbrel login: requests from the app's
 			// page to this host cannot carry the app host's `__Host-` cookie.
-			const host = appPortRemoteHost(this.#remoteDomain!, dispatch.appId, dispatch.port)!
-			let proxy = this.#remotePortProxies.get(host)
-			if (!proxy) {
-				proxy = this.createProxyMiddleware(dispatch.port, 'https', {
-					includeForwardedFor: false,
-					internalUpgradeSubscription: false,
-				})
-				this.#remotePortProxies.set(host, proxy)
+			const target = this.remoteAppBrowserPorts(dispatch.appId).find(({port}) => port === dispatch.port)?.upstream
+			if (!target) {
+				this.requestBrowserPortRecovery(dispatch.appId)
+				return
 			}
-			return proxy
+			const host = appPortRemoteHost(this.#remoteDomain!, dispatch.appId, dispatch.port)!
+			const upstream = hostWithPort(target.host, target.port)
+			let entry = this.#remotePortProxies.get(host)
+			if (entry?.upstream !== upstream) {
+				entry = {
+					upstream,
+					proxy: this.createProxyMiddleware(target.port, 'https', {
+						upstreamHost: target.host,
+						includeForwardedFor: false,
+						internalUpgradeSubscription: false,
+						onUpstreamError: () => this.requestBrowserPortRecovery(dispatch.appId),
+					}),
+				}
+				this.#remotePortProxies.set(host, entry)
+			}
+			return entry.proxy
 		}
 	}
 
@@ -1166,8 +1215,10 @@ export default class LanIngress {
 		}
 		const handler = this.remoteHandler(dispatch)
 		if (!handler) {
-			response.writeHead(404, {'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store'})
-			response.end('Not Found\n')
+			// An extra port whose container is not resolvable yet (still starting).
+			const status = dispatch.type === 'port' ? 502 : 404
+			response.writeHead(status, {'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store'})
+			response.end(`${http.STATUS_CODES[status]}\n`)
 			return true
 		}
 		handler(request as any, response as any, (error?: unknown) => {
@@ -1187,7 +1238,7 @@ export default class LanIngress {
 		if (dispatch.type === 'dashboard') return false
 		const handler = dispatch.type === 'reject' ? undefined : this.remoteHandler(dispatch)
 		if (!handler?.upgrade) {
-			const status = dispatch.type === 'reject' ? dispatch.status : 404
+			const status = dispatch.type === 'reject' ? dispatch.status : dispatch.type === 'port' ? 502 : 404
 			socket.write(`HTTP/1.1 ${status} ${http.STATUS_CODES[status] ?? 'Error'}\r\nConnection: close\r\n\r\n`)
 			socket.destroy()
 			return true
@@ -1479,7 +1530,13 @@ export default class LanIngress {
 	private createProxyMiddleware(
 		upstreamPort: number,
 		originalProtocol: 'http' | 'https',
-		{includeForwardedFor = true, pathPrefix, internalUpgradeSubscription = true}: UmbrelProxyOptions = {},
+		{
+			includeForwardedFor = true,
+			pathPrefix,
+			internalUpgradeSubscription = true,
+			upstreamHost = '127.0.0.1',
+			onUpstreamError,
+		}: UmbrelProxyOptions = {},
 	): RequestHandler {
 		const rewritePath = pathPrefix
 			? (path: string) =>
@@ -1488,7 +1545,7 @@ export default class LanIngress {
 						: `${pathPrefix}${path}`
 			: undefined
 		return createProxyMiddleware({
-			target: `http://127.0.0.1:${upstreamPort}`,
+			target: `http://${hostWithPort(upstreamHost, upstreamPort)}`,
 			changeOrigin: false,
 			// Upgrades still work with ws false: attachProxyUpgradeHandler calls
 			// middleware.upgrade, which proxies the socket either way.
@@ -1532,7 +1589,8 @@ export default class LanIngress {
 				// body breaks JSON clients mid-poll. The plain-HTTP raw forward path
 				// already resets on upstream failure, so this also keeps HTTP and HTTPS
 				// behavior consistent on the same port.
-				this.logger.verbose(`LAN ingress proxy error to ${upstreamPort}: ${error}`)
+				this.logger.verbose(`LAN ingress proxy error to ${hostWithPort(upstreamHost, upstreamPort)}: ${error}`)
+				onUpstreamError?.()
 				response.destroy()
 			},
 		})

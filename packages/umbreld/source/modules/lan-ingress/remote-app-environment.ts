@@ -51,31 +51,50 @@ export function serviceEnvironment(service: {environment?: unknown}) {
 	return environment
 }
 
-// Host ports the app publishes over TCP.
-export function publishedTcpPorts(compose: ComposeLike) {
-	const ports = new Set<number>()
-	for (const [, service] of serviceEntries(compose)) {
+// Where each published TCP host port lands: the Compose service and its
+// container port. The host port only exists on the Docker host, which umbreld
+// may not share (umbreld in a container), so remote routes dial the service's
+// container on its container port instead, like the app gateway does.
+export type PublishedPortTarget = {service: string; containerPort: number}
+
+export function publishedPortTargets(compose: ComposeLike) {
+	const targets = new Map<number, PublishedPortTarget>()
+	for (const [name, service] of serviceEntries(compose)) {
 		if (!Array.isArray(service.ports)) continue
 		for (const entry of service.ports) {
 			// A bare container port ("80" or 80) gets a random host port, so only
 			// HOST:CONTAINER and IP:HOST:CONTAINER entries name a published port.
 			let published: unknown
+			let target: unknown
 			if (typeof entry === 'string') {
 				if (/\/udp$/i.test(entry.trim())) continue
 				const parts = entry
 					.trim()
 					.replace(/\/tcp$/i, '')
 					.split(':')
-				if (parts.length > 1) published = parts.at(-2)
+				if (parts.length > 1) [published, target] = parts.slice(-2)
 			} else if (entry && typeof entry === 'object' && 'published' in entry) {
 				if ('protocol' in entry && entry.protocol === 'udp') continue
 				published = entry.published
+				target = 'target' in entry ? entry.target : undefined
 			}
 			const port = Number(published)
-			if (Number.isInteger(port) && port > 0 && port <= 65_535) ports.add(port)
+			const containerPort = Number(target)
+			if (!isPort(port) || targets.has(port)) continue
+			// Ranges ("8000-8001:8000-8001") are not a single upstream.
+			targets.set(port, {service: name, containerPort: isPort(containerPort) ? containerPort : 0})
 		}
 	}
-	return ports
+	return targets
+}
+
+function isPort(port: number) {
+	return Number.isInteger(port) && port > 0 && port <= 65_535
+}
+
+// Host ports the app publishes over TCP.
+export function publishedTcpPorts(compose: ComposeLike) {
+	return new Set(publishedPortTargets(compose).keys())
 }
 
 // Published ports, other than the app's main port, that its own environment

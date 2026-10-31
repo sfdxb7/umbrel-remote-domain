@@ -2,6 +2,7 @@ import {describe, expect, test} from 'vitest'
 
 import {
 	browserFacingPorts,
+	publishedPortTargets,
 	publishedTcpPorts,
 	remoteAppEnvironment,
 	serviceEnvironment,
@@ -99,6 +100,26 @@ describe('remote app environment', () => {
 			},
 		}
 		expect([...publishedTcpPorts(compose)].sort()).toEqual([8001, 8002, 8006])
+	})
+
+	test('extra ports map to the service and container port behind the published port', () => {
+		// The remote route dials these, not the host port, which umbreld may not
+		// share when it runs in a container.
+		const targets = publishedPortTargets(lobeChat)
+		expect(targets.get(7458)).toEqual({service: 'rustfs', containerPort: 9000})
+		expect(targets.get(7459)).toEqual({service: 'gateway', containerPort: 8787})
+		expect(targets.get(7460)).toEqual({service: 'gateway', containerPort: 8788})
+		const compose = {
+			services: {
+				a: {ports: ['127.0.0.1:8001:80', '8002:81/tcp', '8003:53/udp']},
+				b: {ports: [{target: 9000, published: 8006}]},
+			},
+		}
+		expect([...publishedPortTargets(compose)]).toEqual([
+			[8001, {service: 'a', containerPort: 80}],
+			[8002, {service: 'a', containerPort: 81}],
+			[8006, {service: 'b', containerPort: 9000}],
+		])
 	})
 
 	test('LAN URL forms keep their path and leave other values alone', () => {
