@@ -39,12 +39,32 @@ export function pathJoin(base: string, path: string) {
 	return base.replace(/\/$/, '') + '/' + path.replace(/^\//, '')
 }
 
-export function appToUrl(app: UserApp, protocol = location.protocol) {
-	return isOnionPage() ? `${location.protocol}//${app.hiddenService}` : `${protocol}//${location.hostname}:${app.port}`
+// True when the dashboard is being viewed through the remote domain,
+// i.e. the page host is the base domain or a subdomain of it.
+export function isRemoteDomainHost(hostname: string, remoteBaseDomain?: string) {
+	if (!remoteBaseDomain) return false
+	const host = hostname.toLowerCase().replace(/\.$/, '')
+	return host === remoteBaseDomain || host.endsWith(`.${remoteBaseDomain}`)
 }
 
-export function appToUrlWithAppPath(app: UserApp, protocol = location.protocol) {
-	return urlJoin(appToUrl(app, protocol), app.path ?? '')
+type AppUrlFields = Pick<UserApp, 'hiddenService' | 'port'> & {remoteUrl?: string | null}
+
+// `remoteBaseDomain` is only set while remote domain mode is active. On the
+// remote domain, apps open on their own https host; IP, LAN, mDNS and
+// Tailscale pages keep using ports.
+export function appToUrl(
+	app: AppUrlFields,
+	protocol = location.protocol,
+	remoteBaseDomain?: string,
+	page: Pick<Location, 'protocol' | 'hostname' | 'origin'> = location,
+) {
+	if (page.origin.indexOf('.onion') !== -1) return `${page.protocol}//${app.hiddenService}`
+	if (app.remoteUrl && isRemoteDomainHost(page.hostname, remoteBaseDomain)) return app.remoteUrl
+	return `${protocol}//${page.hostname}:${app.port}`
+}
+
+export function appToUrlWithAppPath(app: UserApp, protocol = location.protocol, remoteBaseDomain?: string) {
+	return urlJoin(appToUrl(app, protocol, remoteBaseDomain), app.path ?? '')
 }
 
 const ALWAYS_OPEN_HTTPS_REQUIRED_APPS_KEY = 'UMBREL_ALWAYS_OPEN_HTTPS_REQUIRED_APPS'

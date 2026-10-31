@@ -41,6 +41,10 @@ export function useLaunchApp() {
 	// Open tracking is owner-only (it powers the owner's cmd-k suggestions)
 	const userQ = trpcReact.user.get.useQuery()
 	const isMember = userQ.data?.role === 'member'
+	// Remote domain mode: apps open on their own https host when the
+	// dashboard itself is viewed through the remote domain.
+	const remoteDomainQ = trpcReact.lanIngress.getRemoteDomain.useQuery(undefined, {staleTime: 60_000})
+	const remoteBaseDomain = remoteDomainQ.data?.active ? remoteDomainQ.data.baseDomain : undefined
 
 	const handleLaunch = (appId: string, options?: {path?: string; direct?: boolean; protocol?: 'http:' | 'https:'}) => {
 		const app = userApp.userAppsKeyed?.[appId]
@@ -52,7 +56,9 @@ export function useLaunchApp() {
 
 		const open = (path?: string, protocol = location.protocol) => {
 			if (!isMember) trackOpenMut.mutate({appId})
-			const url = path ? urlJoin(appToUrl(app, protocol), path) : appToUrlWithAppPath(app, protocol)
+			const url = path
+				? urlJoin(appToUrl(app, protocol, remoteBaseDomain), path)
+				: appToUrlWithAppPath(app, protocol, remoteBaseDomain)
 			window.open(url, '_blank')?.focus()
 		}
 

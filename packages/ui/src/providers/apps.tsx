@@ -156,6 +156,23 @@ export function AppsProvider({children}: {children: React.ReactNode}) {
 		},
 	)
 
+	// Remote-domain app links come from apps.list (remoteUrl). A new app's
+	// route becomes ready a moment after its state turns ready, so refetch when
+	// the routed set changes instead of waiting for the mode to be toggled.
+	trpcReact.eventBus.listen.useSubscription(
+		{event: 'lan-ingress:remote-routes:change'},
+		{
+			enabled: !!userQ.data,
+			onData() {
+				utils.apps.list.invalidate()
+				utils.lanIngress.getRemoteDomain.invalidate()
+			},
+			onError(err) {
+				console.error('eventBus.listen(lan-ingress:remote-routes:change) subscription error', err)
+			},
+		},
+	)
+
 	// Remove apps that have an error
 	// TODO: consider passing these down in some places (like the desktop)
 	const userApps = filter(appsQ.data ?? [], (app): app is UserApp => !('error' in app))

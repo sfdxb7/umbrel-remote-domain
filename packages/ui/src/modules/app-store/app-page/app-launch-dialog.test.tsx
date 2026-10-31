@@ -32,6 +32,7 @@ vi.mock('@/trpc/trpc', () => ({
 			hideCredentialsBeforeOpen: {useMutation: () => ({mutate: fixtures.hideCredentials, isPending: false})},
 		},
 		user: {get: {useQuery: () => ({data: {role: fixtures.role}})}},
+		lanIngress: {getRemoteDomain: {useQuery: () => ({data: undefined})}},
 	},
 }))
 ;(globalThis as {IS_REACT_ACT_ENVIRONMENT?: boolean}).IS_REACT_ACT_ENVIRONMENT = true
