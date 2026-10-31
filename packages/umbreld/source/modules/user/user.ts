@@ -8,6 +8,7 @@ import type {ViewPreferences} from '../files/files.js'
 import * as totp from '../utilities/totp.js'
 import {removeAccountAvatarDirectory} from './avatar.js'
 import {OWNER_USER_ID} from './constants.js'
+import LoginThrottle, {ACCOUNT_POLICY, IP_POLICY} from './login-throttle.js'
 
 export type Member = {
 	id: string
@@ -54,6 +55,22 @@ export type AccountLoginValidation =
 	| {valid: true; sessionIssuanceRevision: number}
 	| {valid: false; reason: 'incorrect-password' | 'missing-totp' | 'incorrect-totp'}
 
+export type LoginClient = {
+	// Best known client address (see server/client-ip.ts)
+	ip: string
+	// The request came in on the public remote domain. Remote failures count
+	// against separate account keys so internet traffic cannot lock out the LAN.
+	remote: boolean
+}
+
+export type AccountLoginAttempt =
+	| (AccountLoginValidation & {userId: string})
+	| {valid: false; reason: 'rate-limited'; retryAfterSeconds: number}
+
+// Compared against when the account does not exist, so an unknown name costs
+// the same bcrypt time as a wrong password. Hash of a random string.
+const DUMMY_PASSWORD_HASH = '$2b$12$YEDQnm3EYfCA4.rE1soTd.bbqoXhcbtfVUxgj9K5YtoimywVDCSBS'
+
 const isActiveMember = (member: MemberRecord): member is Member => !('deleted' in member)
 const isDeletedMember = (member: MemberRecord): member is DeletedMember => 'deleted' in member
 
@@ -61,6 +78,7 @@ export default class User {
 	#store: Umbreld['store']
 	logger: Umbreld['logger']
 	#umbreld: Umbreld
+	loginThrottle = new LoginThrottle()
 	constructor(umbreld: Umbreld) {
 		this.#store = umbreld.store
 		const {name} = this.constructor
@@ -450,7 +468,11 @@ export default class User {
 		const sessionIssuanceRevision = this.#umbreld.auth.sessionIssuanceRevision(userId)
 		const account = userId === OWNER_USER_ID ? await this.get() : await this.getMember(userId)
 
-		if (!account?.hashedPassword || !(await bcrypt.compare(password, account.hashedPassword))) {
+		if (!account?.hashedPassword) {
+			await bcrypt.compare(password, DUMMY_PASSWORD_HASH)
+			return {valid: false, reason: 'incorrect-password'}
+		}
+		if (!(await bcrypt.compare(password, account.hashedPassword))) {
 			return {valid: false, reason: 'incorrect-password'}
 		}
 		if (account.totpUri) {
@@ -459,6 +481,67 @@ export default class User {
 		}
 
 		return {valid: true, sessionIssuanceRevision}
+	}
+
+	// Find the account a typed username refers to: the owner's or a member's
+	// display name, or a member's id, compared case-insensitively. Used where
+	// the account list is hidden (the remote domain).
+	async resolveLoginUsername(username: string): Promise<string | undefined> {
+		const wanted = username.trim().toLowerCase()
+		if (!wanted) return OWNER_USER_ID
+		const owner = await this.get()
+		if (owner?.name?.trim().toLowerCase() === wanted) return OWNER_USER_ID
+		const members = await this.listMembers()
+		return (
+			members.find((member) => member.name.trim().toLowerCase() === wanted)?.id ??
+			members.find((member) => member.id.toLowerCase() === wanted)?.id
+		)
+	}
+
+	// Validate a login with backoff. Every password login path (tRPC login and
+	// loginNative, and the app-auth form) goes through here.
+	async attemptAccountLogin({
+		userId,
+		username,
+		password,
+		totpToken,
+		client,
+	}: {
+		userId?: string
+		username?: string
+		password: string
+		totpToken?: string
+		client: LoginClient
+	}): Promise<AccountLoginAttempt> {
+		const typedName = username?.trim()
+		const resolvedUserId = typedName ? await this.resolveLoginUsername(typedName) : (userId ?? OWNER_USER_ID)
+		const accountKey = resolvedUserId ?? `unknown:${typedName!.toLowerCase()}`
+		const scope = client.remote ? 'remote' : 'local'
+		const attempt = this.loginThrottle.begin([
+			{key: `account:${scope}:${accountKey}`, policy: ACCOUNT_POLICY},
+			{key: `ip:${client.ip}`, policy: IP_POLICY},
+		])
+		if (!attempt.allowed) {
+			this.logger.error(`Login throttled for ${client.remote ? 'remote' : 'local'} client ${client.ip}`)
+			return {valid: false, reason: 'rate-limited', retryAfterSeconds: Math.ceil(attempt.retryAfterMs / 1000)}
+		}
+
+		let result: AccountLoginValidation
+		if (resolvedUserId === undefined) {
+			await bcrypt.compare(password, DUMMY_PASSWORD_HASH)
+			result = {valid: false, reason: 'incorrect-password'}
+		} else {
+			try {
+				result = await this.validateAccountLogin(resolvedUserId, password, totpToken)
+			} catch (error) {
+				attempt.cancel()
+				throw error
+			}
+		}
+
+		if (result.valid) attempt.succeed()
+		else if (result.reason === 'missing-totp') attempt.cancel()
+		return {...result, userId: resolvedUserId ?? accountKey}
 	}
 
 	// ── Account scoped settings ─────────────────────────────────────────────

@@ -1,3 +1,4 @@
+import type {RequestHandler} from 'express'
 import {createExpressMiddleware} from '@trpc/server/adapters/express'
 import {applyWSSHandler} from '@trpc/server/adapters/ws'
 
@@ -66,13 +67,54 @@ export function createInternalTrpcCaller(umbreld: Umbreld): InternalTrpcCaller {
 	})
 }
 
-export const trpcExpressHandler = createExpressMiddleware({
+const trpcExpressMiddleware = createExpressMiddleware({
 	router: appRouter,
 	createContext: createContextExpress,
 	onError({error, ctx}) {
 		ctx?.logger.error(`${ctx?.request?.method} ${ctx?.request?.path}`, error)
 	},
 })
+
+// Procedures that check a password or hand out credentials. tRPC's HTTP
+// batching (`/trpc/a,b,c?batch=1`) would let one request carry many password
+// guesses, so these are refused inside a batch. The UI never batches.
+export const AUTH_PROCEDURES = new Set([
+	'user.login',
+	'user.loginNative',
+	'user.refreshNativeAccess',
+	'user.register',
+	'user.verifyPassword',
+	'user.changePassword',
+	'user.enable2fa',
+	'user.disable2fa',
+])
+
+// The auth procedures in a batched request path, e.g. '/user.login,user.login'.
+// Single calls return an empty list.
+export function batchedAuthProcedures(path: string) {
+	let decoded: string
+	try {
+		decoded = decodeURIComponent(path)
+	} catch {
+		return []
+	}
+	const procedures = decoded.replace(/^\/+/, '').split(',')
+	if (procedures.length < 2) return []
+	return procedures.filter((procedure) => AUTH_PROCEDURES.has(procedure.trim()))
+}
+
+export const trpcExpressHandler: RequestHandler = (request, response, next) => {
+	if (batchedAuthProcedures(request.path).length > 0) {
+		return response.status(400).json({
+			error: {
+				code: -32600,
+				message: 'Authentication procedures cannot be batched',
+				data: {code: 'BAD_REQUEST', httpStatus: 400},
+			},
+		})
+	}
+	return trpcExpressMiddleware(request, response, next)
+}
 
 export const trpcWssHandler = ({
 	wss,
