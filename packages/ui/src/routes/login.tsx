@@ -37,6 +37,10 @@ export default function Login() {
 	// the picker is skipped on single-user devices (identical to the old flow).
 	const accountsQ = trpcReact.user.listAccounts.useQuery(undefined, {retry: false})
 	const rawAccounts: Account[] = useMemo(() => accountsQ.data ?? [], [accountsQ.data])
+	// On the remote domain the server answers with an empty list instead of
+	// naming its accounts, so ask for the account name instead
+	const askUsername = accountsQ.isSuccess && rawAccounts.length === 0
+	const [username, setUsername] = useState('')
 	const {
 		accounts,
 		hasMultipleAccounts,
@@ -148,13 +152,13 @@ export default function Login() {
 		e.preventDefault()
 		if (activeLoginUserIdRef.current !== undefined || loginMut.isPending) return
 		activeLoginUserIdRef.current = userId
-		loginMut.mutate({userId, password})
+		loginMut.mutate({userId, password, ...(askUsername ? {username} : {})})
 	}
 
 	const handleSubmit2fa = async (totpToken: string) => {
 		if (activeLoginUserIdRef.current !== undefined || loginMut.isPending) return false
 		activeLoginUserIdRef.current = userId
-		const res = await loginMut.mutateAsync({userId, password, totpToken})
+		const res = await loginMut.mutateAsync({userId, password, totpToken, ...(askUsername ? {username} : {})})
 		return selectedUserIdRef.current === userId && !!res
 	}
 
@@ -215,6 +219,7 @@ export default function Login() {
 						error={loginError}
 						isPending={loginIsPending}
 						onSubmit={handleSubmitPassword}
+						{...(askUsername ? {username, onUsernameChange: setUsername} : {})}
 					/>
 				</div>
 				{confirmDialog}

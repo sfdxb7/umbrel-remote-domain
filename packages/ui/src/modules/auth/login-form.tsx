@@ -1,7 +1,7 @@
 import {Loader2} from 'lucide-react'
 import {useTranslation} from 'react-i18next'
 
-import {PasswordInput} from '@/components/ui/input'
+import {Input, PasswordInput} from '@/components/ui/input'
 import {formGroupClass, primaryButtonProps, SubTitle, Title} from '@/layouts/bare/shared'
 import {cn} from '@/lib/utils'
 import {type Account} from '@/modules/auth/use-account-picker'
@@ -21,6 +21,8 @@ export function LoginForm({
 	onSubmit,
 	subtitle,
 	submitLabel,
+	username,
+	onUsernameChange,
 }: {
 	account?: Account
 	password: string
@@ -30,7 +32,12 @@ export function LoginForm({
 	onSubmit: (event: React.FormEvent<HTMLFormElement>) => void
 	subtitle?: string
 	submitLabel?: string
+	// Shown when the server hides the account list (the remote domain). An
+	// empty username means the owner.
+	username?: string
+	onUsernameChange?: (username: string) => void
 }) {
+	const askUsername = onUsernameChange !== undefined
 	const {t} = useTranslation()
 	return (
 		<>
@@ -55,9 +62,21 @@ export function LoginForm({
 			</div>
 			<form className='flex w-full flex-col items-center gap-5 px-4 md:px-0' onSubmit={onSubmit}>
 				<div className={cn(formGroupClass, 'max-w-[320px] [&_input]:bg-slate-500/15 [&_input]:backdrop-blur-xl')}>
+					{askUsername && (
+						<Input
+							placeholder={t('login.username-label')}
+							aria-label={t('login.username-label')}
+							autoComplete='username'
+							autoCapitalize='none'
+							spellCheck={false}
+							autoFocus
+							value={username ?? ''}
+							onValueChange={onUsernameChange}
+						/>
+					)}
 					<PasswordInput
 						label={t('login.password-label')}
-						autoFocus
+						autoFocus={!askUsername}
 						value={password}
 						onValueChange={onPasswordChange}
 						error={error}

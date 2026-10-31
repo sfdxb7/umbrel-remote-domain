@@ -32,15 +32,22 @@ function useAccounts() {
 	// isLoaded flips once the request settles (success or failure) — the page
 	// holds on the bare wallpaper until then so the single-account form never
 	// flashes before the dock
-	const [state, setState] = useState<{accounts: Account[]; isLoaded: boolean}>({accounts: [], isLoaded: false})
+	// askUsername: the server answered with an empty list, as it does on the
+	// remote domain instead of naming its accounts
+	const [state, setState] = useState<{accounts: Account[]; isLoaded: boolean; askUsername: boolean}>({
+		accounts: [],
+		isLoaded: false,
+		askUsername: false,
+	})
 
 	useEffect(() => {
 		fetch('/v1/account/accounts')
 			.then(async (res) => {
 				const data = (await res.json()) as unknown
-				setState({accounts: Array.isArray(data) ? (data as Account[]) : [], isLoaded: true})
+				const accounts = Array.isArray(data) ? (data as Account[]) : []
+				setState({accounts, isLoaded: true, askUsername: res.ok && Array.isArray(data) && accounts.length === 0})
 			})
-			.catch(() => setState({accounts: [], isLoaded: true}))
+			.catch(() => setState({accounts: [], isLoaded: true, askUsername: false}))
 	}, [])
 
 	return state
@@ -59,7 +66,8 @@ export default function LoginWithUmbrel() {
 	const [step, setStep] = useState<Step>('account')
 
 	// Owner centered, members alternating outwards — same dock as the lock screen
-	const {accounts: rawAccounts, isLoaded: accountsLoaded} = useAccounts()
+	const {accounts: rawAccounts, isLoaded: accountsLoaded, askUsername} = useAccounts()
+	const [username, setUsername] = useState('')
 	const {
 		accounts,
 		hasMultipleAccounts,
@@ -141,7 +149,10 @@ export default function LoginWithUmbrel() {
 		if (!attempt) return
 		setError(undefined)
 		try {
-			const data = await login({userId: attempt.userId, password, totpToken: ''}, () => isCurrentLoginAttempt(attempt))
+			const data = await login(
+				{userId: attempt.userId, username: askUsername ? username : undefined, password, totpToken: ''},
+				() => isCurrentLoginAttempt(attempt),
+			)
 			if (!isCurrentLoginAttempt(attempt)) {
 				finishLoginAttempt(attempt)
 				return
@@ -181,7 +192,10 @@ export default function LoginWithUmbrel() {
 		const attempt = beginLoginAttempt()
 		if (!attempt) return false
 		try {
-			const data = await login({userId: attempt.userId, password, totpToken}, () => isCurrentLoginAttempt(attempt))
+			const data = await login(
+				{userId: attempt.userId, username: askUsername ? username : undefined, password, totpToken},
+				() => isCurrentLoginAttempt(attempt),
+			)
 			if (!isCurrentLoginAttempt(attempt)) {
 				finishLoginAttempt(attempt)
 				return false
@@ -335,6 +349,7 @@ export default function LoginWithUmbrel() {
 												onSubmit={handleSubmitPassword}
 												subtitle={app.name ? t('login-with-umbrel.description', {app: app.name}) : undefined}
 												submitLabel={app.name ? t('login-with-umbrel.open-app', {app: app.name}) : undefined}
+												{...(askUsername ? {username, onUsernameChange: setUsername} : {})}
 											/>
 										</div>
 									</motion.div>
@@ -352,14 +367,14 @@ function useLogin() {
 	// /v1/account/login
 
 	const login = (
-		{userId, password, totpToken}: {userId: string; password: string; totpToken: string},
+		{userId, username, password, totpToken}: {userId: string; username?: string; password: string; totpToken: string},
 		shouldSubmit: () => boolean,
 	) => {
 		// Forward the query params to the login endpoint
 		return fetch('/v1/account/login' + document.location.search, {
 			method: 'POST',
 			headers: {'Content-Type': 'application/json'},
-			body: JSON.stringify({userId, password, totpToken}),
+			body: JSON.stringify({userId, password, totpToken, ...(username === undefined ? {} : {username})}),
 		}).then(async (res) => {
 			const parsed = (await res.json()) as LoginResponse | string
 			// The server responds with a bare string for request validation

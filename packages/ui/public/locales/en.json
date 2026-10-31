@@ -2820,5 +2820,13 @@
   "remote-domain.apps-title": "Apps on the remote domain",
   "remote-domain.apps-description": "Apps with Umbrel's login turned off are blocked on the remote domain. Allow one only if the app has its own login.",
   "remote-domain.app-allowed": "Allowed without Umbrel login at {{origin}}",
-  "remote-domain.app-blocked": "Blocked: Umbrel's login is off for this app"
+  "remote-domain.app-blocked": "Blocked: Umbrel's login is off for this app",
+  "login.username-label": "Account name (leave empty for the owner)",
+  "remote-domain.2fa-warning": "Two-factor authentication is off for your account. With a remote domain your login page is on the internet, so turn on 2FA in Settings.",
+  "remote-domain.trusted-proxies": "Trusted reverse proxies",
+  "remote-domain.trusted-proxies-help": "IP addresses or ranges (CIDR) of the reverse proxies in front of this device, separated by commas. Only these may tell umbrelOS a visitor's real IP, which login rate limiting uses. Leave empty for loopback and private networks.",
+  "remote-domain.client-ip-header": "Client IP header",
+  "remote-domain.client-ip-header-help": "Optional. A header your trusted proxy sets to the visitor's IP, such as X-Real-IP. Leave empty to use X-Forwarded-For.",
+  "remote-domain.public-paths": "Allow public paths on the remote domain",
+  "remote-domain.public-paths-help": "This app makes {{paths}} reachable without Umbrel's login. On the remote domain those paths stay behind the login unless you allow them here. Only allow this if the app protects them itself."
 }
